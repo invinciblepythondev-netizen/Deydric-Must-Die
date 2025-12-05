@@ -1,0 +1,31 @@
+# Core Framework
+Flask==3.0.0
+Flask-SQLAlchemy==3.1.1
+python-dotenv==1.0.0
+
+# Database
+SQLAlchemy>=2.0.36  # Latest version for Python 3.14 compatibility
+psycopg[binary]>=3.1.0  # Psycopg3 for Python 3.14 compatibility
+alembic>=1.13.1
+
+# LLM Providers
+anthropic==0.39.0
+openai>=2.9.0  # Upgraded for Python 3.14 compatibility
+
+# Vector Database
+# chromadb==0.4.22  # Disabled - pulsar-client not available on Windows
+qdrant-client>=1.7.0  # Qdrant vector database for semantic memory
+
+# Cloud Storage
+google-cloud-storage==2.14.0
+
+# Utilities
+networkx==3.2.1
+tiktoken>=0.12.0
+requests==2.31.0
+
+# Development
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.12.1
+flake8==6.1.0

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/init_db.py:*)",
+      "Bash(python scripts/migrate_db.py:*)",
+      "Bash(python -X utf8 -c:*)",
+      "Bash(python -X utf8:*)",
+      "Bash(python -m venv:*)",
+      "Bash(./venv/Scripts/python.exe -m pip:*)",
+      "Bash(./venv/Scripts/python.exe test_flask_app.py)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

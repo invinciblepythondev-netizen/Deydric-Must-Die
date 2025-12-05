@@ -1,0 +1,110 @@
+{
+  "49638031-71bf-4ee7-9ce1-bd43bfe6d29d": {
+    "name": "Branndic Solt",
+    "short_name": "Brand",
+    "traits": [
+      [
+        "Methodical Planner",
+        6
+      ],
+      [
+        "Detail-Oriented",
+        5
+      ]
+    ]
+  },
+  "6dd99115-e9d9-4b0f-a090-d01978872d99": {
+    "name": "Castellan Marrek Veyne",
+    "short_name": "Marrek",
+    "traits": [
+      [
+        "Methodical Planner",
+        8
+      ],
+      [
+        "Detail-Oriented",
+        7
+      ]
+    ]
+  },
+  "e6212f28-1081-4e8e-89e3-49e26a4a4372": {
+    "name": "Fizrae Yinai",
+    "short_name": "Fizrae",
+    "traits": [
+      [
+        "Strategic Thinker",
+        7
+      ],
+      [
+        "Impulsive",
+        7
+      ]
+    ]
+  },
+  "266cf37e-286b-49ab-ae8d-4dcc36f61c1d": {
+    "name": "Lysa Darnog",
+    "short_name": "Lysa",
+    "traits": [
+      [
+        "Methodical Planner",
+        6
+      ],
+      [
+        "Detail-Oriented",
+        5
+      ]
+    ]
+  },
+  "d3172ea7-e70a-4d99-a3d2-56f6f32a15d5": {
+    "name": "Mable Carptun",
+    "short_name": "Mable",
+    "traits": [
+      [
+        "Methodical Planner",
+        6
+      ],
+      [
+        "Detail-Oriented",
+        5
+      ]
+    ]
+  },
+  "096d9f1f-4a13-4708-9c3e-70527b0f1925": {
+    "name": "Master Coren Vallis",
+    "short_name": "Master Coren",
+    "traits": [
+      [
+        "Methodical Planner",
+        8
+      ],
+      [
+        "Detail-Oriented",
+        7
+      ]
+    ]
+  },
+  "ec4d607c-b04a-4ed6-b523-e62741c7d6e7": {
+    "name": "Piot Hamptill",
+    "short_name": "Piot",
+    "traits": [
+      [
+        "Laid-Back",
+        6
+      ]
+    ]
+  },
+  "f3807eaf-6d3a-425c-8916-32fd226d899f": {
+    "name": "Sir Gelarthon Findraell",
+    "short_name": "Sir Gelarthon",
+    "traits": [
+      [
+        "Methodical Planner",
+        6
+      ],
+      [
+        "Detail-Oriented",
+        5
+      ]
+    ]
+  }
+}
