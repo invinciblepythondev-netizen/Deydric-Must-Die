@@ -28,16 +28,20 @@ class ActionType(Enum):
     STEAL = "steal"              # Take something covertly
 
 
-class MoodCategory(Enum):
-    """Mood categories for action generation"""
-    NEUTRAL = "neutral"
-    TENSE = "tense"
-    RELAXED = "relaxed"
-    ANTAGONISTIC = "antagonistic"
-    VIOLENT = "violent"
-    ROMANTIC = "romantic"
-    FLIRTATIOUS = "flirtatious"
-    COOPERATIVE = "cooperative"
+# DEPRECATED: MoodCategory enum removed in favor of dynamic LLM-generated mood strings
+# Keeping this for reference of common mood types, but mood_category is now a free-form string
+# Examples: "neutral", "tense", "romantic", "hostile", "conflicted", "playful", "melancholic", etc.
+#
+# class MoodCategory(Enum):
+#     """Mood categories for action generation"""
+#     NEUTRAL = "neutral"
+#     TENSE = "tense"
+#     RELAXED = "relaxed"
+#     ANTAGONISTIC = "antagonistic"
+#     VIOLENT = "violent"
+#     ROMANTIC = "romantic"
+#     FLIRTATIOUS = "flirtatious"
+#     COOPERATIVE = "cooperative"
 
 
 @dataclass
@@ -96,6 +100,7 @@ class ActionSequence:
     deescalates_mood: bool  # Does this de-escalate tension?
     emotional_tone: str  # e.g., "cunning", "aggressive", "friendly"
     estimated_mood_impact: Dict[str, int] = field(default_factory=dict)  # {tension: +10, hostility: +5}
+    turn_duration: int = 1  # Number of turns this action takes (1 turn = ~30 seconds)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -105,7 +110,8 @@ class ActionSequence:
             'escalates_mood': self.escalates_mood,
             'deescalates_mood': self.deescalates_mood,
             'emotional_tone': self.emotional_tone,
-            'estimated_mood_impact': self.estimated_mood_impact
+            'estimated_mood_impact': self.estimated_mood_impact,
+            'turn_duration': self.turn_duration
         }
 
     @classmethod
@@ -117,7 +123,8 @@ class ActionSequence:
             escalates_mood=data['escalates_mood'],
             deescalates_mood=data['deescalates_mood'],
             emotional_tone=data['emotional_tone'],
-            estimated_mood_impact=data.get('estimated_mood_impact', {})
+            estimated_mood_impact=data.get('estimated_mood_impact', {}),
+            turn_duration=data.get('turn_duration', 1)
         )
 
     def get_public_description(self) -> str:
@@ -178,7 +185,7 @@ class GeneratedActionOptions:
     character_id: str
     turn_number: int
     options: List[ActionOption]
-    mood_category: MoodCategory
+    mood_category: str  # Dynamic LLM-generated mood (e.g., "tense", "romantic", "playful", "hostile")
     generation_context: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -187,7 +194,7 @@ class GeneratedActionOptions:
             'character_id': self.character_id,
             'turn_number': self.turn_number,
             'options': [opt.to_dict() for opt in self.options],
-            'mood_category': self.mood_category.value,
+            'mood_category': self.mood_category,  # Already a string
             'generation_context': self.generation_context
         }
 
@@ -198,7 +205,7 @@ class GeneratedActionOptions:
             character_id=data['character_id'],
             turn_number=data['turn_number'],
             options=[ActionOption.from_dict(opt) for opt in data['options']],
-            mood_category=MoodCategory(data['mood_category']),
+            mood_category=data.get('mood_category', 'neutral'),  # Direct string, default to 'neutral'
             generation_context=data.get('generation_context', {})
         )
 
@@ -245,7 +252,8 @@ def create_simple_sequence(
     actions: List[SingleAction],
     escalates: bool = False,
     deescalates: bool = False,
-    emotional_tone: str = "neutral"
+    emotional_tone: str = "neutral",
+    turn_duration: int = 1
 ) -> ActionSequence:
     """Helper to create a simple action sequence."""
     return ActionSequence(
@@ -253,5 +261,6 @@ def create_simple_sequence(
         summary=summary,
         escalates_mood=escalates,
         deescalates_mood=deescalates,
-        emotional_tone=emotional_tone
+        emotional_tone=emotional_tone,
+        turn_duration=turn_duration
     )

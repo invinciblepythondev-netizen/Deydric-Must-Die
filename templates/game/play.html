@@ -1,0 +1,312 @@
+{% extends "base.html" %}
+
+{% block title %}Play - Deydric Must Die{% endblock %}
+
+{% block content %}
+<div class="game-container">
+    <div class="game-info">
+        <h2>Turn {{ current_turn }}</h2>
+        <p><strong>Playing as:</strong> {{ player_name }}</p>
+        <p><strong>Location:</strong> {{ location_name }}</p>
+    </div>
+
+    <div class="location-description collapsed" id="location-description">
+        <h3 onclick="toggleLocationDescription()">
+            {{ location_name }}
+            <span class="collapse-icon">▼</span>
+        </h3>
+        <div class="location-content collapsed">
+            <p>{{ location_description }}</p>
+        </div>
+    </div>
+
+    {% if other_characters %}
+    <div class="characters-container collapsed" id="characters-container">
+        <h3 onclick="toggleCharactersPresent()">
+            Characters Present
+            <span class="collapse-icon">▼</span>
+        </h3>
+        <div class="characters-content collapsed">
+            <div class="character-list">
+            {% for char in other_characters %}
+                <div class="character-card" onclick="toggleCharacterDetails(this)">
+                    <div class="character-card-header">
+                        {% if char.image_url %}
+                        <div class="character-portrait">
+                            <img src="{{ char.image_url }}" alt="{{ char.name }}" />
+                        </div>
+                        {% endif %}
+                        <div class="character-basic-info">
+                            <strong>{{ char.name }}</strong>
+                            <span class="character-stance">({{ char.stance }})</span>
+                        </div>
+                        <div class="expand-icon">▼</div>
+                    </div>
+                    <div class="character-details" style="display: none;">
+                        <p class="character-description"><strong>Appearance:</strong> {{ char.appearance }}</p>
+                        {% if char.clothing %}
+                        <p class="character-clothing"><strong>Wearing:</strong> {{ char.clothing }}</p>
+                        {% else %}
+                        <p class="character-clothing"><strong>Wearing:</strong> <em>Not specified</em></p>
+                        {% endif %}
+                    </div>
+                </div>
+            {% endfor %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="turn-history" id="turn-history">
+        <h3>Recent Events</h3>
+        <div class="history-list">
+            {% for group in history %}
+            <div class="history-item {% if group.is_private %}private{% elif group.is_atmospheric %}atmospheric{% endif %}">
+                {% if not group.is_atmospheric %}
+                <span class="turn-badge">Turn {{ group.turn_number }}</span>
+                <span class="character-name">{{ group.character_name }}:</span>
+                {% endif %}
+
+                {% for event in group.events %}
+                    {% if event.action_type == 'think' %}
+                        <p class="action-text thought-action"><em>{{ event.action_description }}</em></p>
+                    {% elif event.action_type == 'speak' or 'say' in event.action_description.lower()[:20] %}
+                        <p class="action-text speech-action">"{{ event.action_description }}"</p>
+                    {% elif event.is_atmospheric %}
+                        <p class="action-text atmospheric-text">{{ event.action_description }}</p>
+                    {% else %}
+                        <p class="action-text">{{ event.action_description }}</p>
+                    {% endif %}
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="action-interface">
+        <div id="action-options" class="action-options">
+            <h3>Your Turn - Choose an Action</h3>
+            <div id="actions-list"></div>
+        </div>
+
+        <div id="ai-turn-section" class="ai-turn-section" style="display: none;">
+            <h3>AI Characters' Turn</h3>
+            <p id="ai-status">AI characters are taking their turns...</p>
+        </div>
+    </div>
+
+    <div id="loading" class="loading" style="display: none;">
+        <p>Processing...</p>
+    </div>
+</div>
+
+<script>
+    const gameId = "{{ game_id }}";
+    const playerId = "{{ player_id }}";
+    const currentTurn = {{ current_turn }};
+
+    // Auto-scroll history to bottom on page load
+    function scrollHistoryToBottom() {
+        const historyDiv = document.querySelector('.turn-history');
+        if (historyDiv) {
+            historyDiv.scrollTop = historyDiv.scrollHeight;
+        }
+    }
+
+    // Toggle location description
+    function toggleLocationDescription() {
+        const locationDiv = document.getElementById('location-description');
+        const locationContent = locationDiv.querySelector('.location-content');
+
+        if (locationDiv.classList.contains('collapsed')) {
+            locationDiv.classList.remove('collapsed');
+            locationContent.classList.remove('collapsed');
+            locationContent.style.maxHeight = locationContent.scrollHeight + 'px';
+        } else {
+            locationDiv.classList.add('collapsed');
+            locationContent.classList.add('collapsed');
+            locationContent.style.maxHeight = '0';
+        }
+    }
+
+    // Toggle characters present
+    function toggleCharactersPresent() {
+        const charactersDiv = document.getElementById('characters-container');
+        const charactersContent = charactersDiv.querySelector('.characters-content');
+
+        if (charactersDiv.classList.contains('collapsed')) {
+            charactersDiv.classList.remove('collapsed');
+            charactersContent.classList.remove('collapsed');
+            charactersContent.style.maxHeight = charactersContent.scrollHeight + 'px';
+        } else {
+            charactersDiv.classList.add('collapsed');
+            charactersContent.classList.add('collapsed');
+            charactersContent.style.maxHeight = '0';
+        }
+    }
+
+    // Toggle character details
+    function toggleCharacterDetails(card) {
+        const details = card.querySelector('.character-details');
+        const isExpanded = card.classList.contains('expanded');
+
+        if (isExpanded) {
+            details.style.display = 'none';
+            card.classList.remove('expanded');
+        } else {
+            details.style.display = 'block';
+            card.classList.add('expanded');
+        }
+    }
+
+    // Helper function to escape HTML
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Generate action options
+    async function generateActions() {
+        const actionsList = document.getElementById('actions-list');
+        const loadingDiv = document.getElementById('loading');
+
+        actionsList.innerHTML = '';
+        loadingDiv.style.display = 'block';
+
+        try {
+            const response = await fetch('/game/actions');
+            const data = await response.json();
+
+            loadingDiv.style.display = 'none';
+
+            if (data.actions && data.actions.length > 0) {
+                data.actions.forEach((action, index) => {
+                    const actionDiv = document.createElement('div');
+                    actionDiv.className = 'action-option';
+
+                    // Build action HTML
+                    let actionHTML = `<h4>Option ${index + 1}</h4>`;
+
+                    // Show thought if present (check both field names)
+                    const thought = action.private_thought || action.thought || '';
+                    if (thought && thought.trim()) {
+                        actionHTML += `<p class="thought"><em><strong>Private Thought:</strong> ${escapeHtml(thought)}</em></p>`;
+                    }
+
+                    // Show speech/dialogue if present (check both field names)
+                    const speech = action.dialogue || action.speech || '';
+                    if (speech && speech.trim() && speech !== 'null') {
+                        actionHTML += `<p class="speech"><strong>Say:</strong> "${escapeHtml(speech)}"</p>`;
+                    }
+
+                    // Show physical action
+                    if (action.action && action.action.trim()) {
+                        actionHTML += `<p class="physical-action"><strong>Do:</strong> ${escapeHtml(action.action)}</p>`;
+                    }
+
+                    // Add select button
+                    actionHTML += `
+                        <button class="btn btn-secondary select-action-btn"
+                                data-index="${index}">
+                            Choose This Action
+                        </button>
+                    `;
+
+                    actionDiv.innerHTML = actionHTML;
+                    actionsList.appendChild(actionDiv);
+                });
+
+                // Add event listeners to action buttons
+                document.querySelectorAll('.select-action-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        await selectAction(parseInt(e.target.dataset.index), data.actions);
+                    });
+                });
+            } else {
+                actionsList.innerHTML = '<p>No actions available</p>';
+            }
+        } catch (error) {
+            loadingDiv.style.display = 'none';
+            actionsList.innerHTML = '<p class="error">Error generating actions: ' + error.message + '</p>';
+        }
+    }
+
+    // Select and execute player action
+    async function selectAction(actionIndex, actions) {
+        const selectedAction = actions[actionIndex];
+        const loadingDiv = document.getElementById('loading');
+
+        loadingDiv.style.display = 'block';
+
+        // Get speech/dialogue (check both field names)
+        const speech = selectedAction.dialogue || selectedAction.speech || '';
+        const thought = selectedAction.private_thought || selectedAction.thought || '';
+        const action = selectedAction.action || '';
+
+        try {
+            const response = await fetch('/game/action', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    thought: thought,
+                    dialogue: speech,
+                    action: action
+                })
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+                // Hide player action options, show AI turn section
+                document.getElementById('action-options').style.display = 'none';
+                document.getElementById('ai-turn-section').style.display = 'block';
+
+                // Automatically execute AI turn
+                await executeAITurn();
+            } else {
+                loadingDiv.style.display = 'none';
+                alert('Error: ' + result.error);
+            }
+        } catch (error) {
+            loadingDiv.style.display = 'none';
+            alert('Error: ' + error.message);
+        }
+    }
+
+    // Execute AI turn automatically
+    async function executeAITurn() {
+        const loadingDiv = document.getElementById('loading');
+        const statusP = document.getElementById('ai-status');
+
+        loadingDiv.style.display = 'block';
+        statusP.textContent = 'AI characters are taking their turns...';
+
+        try {
+            const response = await fetch('/game/ai-turn', {method: 'POST'});
+            const result = await response.json();
+
+            loadingDiv.style.display = 'none';
+
+            if (result.success) {
+                statusP.textContent = 'AI turn complete! Refreshing...';
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                statusP.textContent = 'Error: ' + result.error;
+            }
+        } catch (error) {
+            loadingDiv.style.display = 'none';
+            statusP.textContent = 'Error: ' + error.message;
+        }
+    }
+
+    // Initialize on page load
+    window.addEventListener('DOMContentLoaded', () => {
+        // Scroll history to bottom
+        scrollHistoryToBottom();
+
+        // Auto-generate player actions
+        generateActions();
+    });
+</script>
+{% endblock %}

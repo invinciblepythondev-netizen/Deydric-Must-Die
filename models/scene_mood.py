@@ -9,6 +9,7 @@ from sqlalchemy import text
 from typing import Dict, Any, Optional, Tuple
 from uuid import UUID
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,9 @@ class SceneMood:
         Returns:
             UUID of scene_mood record
         """
+        # Convert character_ids list to JSON string for PostgreSQL
+        character_ids_json = json.dumps(character_ids or [])
+
         result = db_session.execute(text("""
             SELECT scene_mood_upsert(
                 p_game_state_id := :game_state_id,
@@ -119,7 +123,7 @@ class SceneMood:
                 p_scene_phase := :scene_phase,
                 p_last_mood_change_turn := :last_mood_change_turn,
                 p_last_mood_change_description := :last_mood_change_description,
-                p_character_ids := :character_ids::jsonb
+                p_character_ids := CAST(:character_ids AS jsonb)
             )
         """), {
             "game_state_id": str(game_state_id),
@@ -135,7 +139,7 @@ class SceneMood:
             "scene_phase": scene_phase,
             "last_mood_change_turn": last_mood_change_turn,
             "last_mood_change_description": last_mood_change_description,
-            "character_ids": character_ids or []
+            "character_ids": character_ids_json
         })
 
         scene_mood_id = result.scalar()
@@ -146,7 +150,11 @@ class SceneMood:
             f"Level {intensity_level} ({intensity_points} pts), arc={dominant_arc}, phase={scene_phase}"
         )
 
-        return UUID(scene_mood_id)
+        # scene_mood_id might already be a UUID object (psycopg3 returns UUID types natively)
+        if isinstance(scene_mood_id, UUID):
+            return scene_mood_id
+        else:
+            return UUID(scene_mood_id)
 
     @staticmethod
     def adjust(

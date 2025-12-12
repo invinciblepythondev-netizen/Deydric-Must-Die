@@ -42,20 +42,15 @@ def create_app():
     # Initialize extensions
     init_db(app)
 
-    # Register blueprints (when routes are created)
-    # from routes import game_bp, character_bp, admin_bp
-    # app.register_blueprint(game_bp)
-    # app.register_blueprint(character_bp)
-    # app.register_blueprint(admin_bp)
+    # Register blueprints
+    from routes.game import game_bp
+    app.register_blueprint(game_bp)
 
-    # Simple health check route
+    # Simple home route
     @app.route('/')
     def index():
-        return {
-            'status': 'online',
-            'game': 'Deydric Must Die',
-            'description': 'Turn-based text adventure with LLM-generated content'
-        }
+        from flask import render_template
+        return render_template('index.html')
 
     @app.route('/health')
     def health():

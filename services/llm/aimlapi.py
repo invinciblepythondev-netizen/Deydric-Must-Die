@@ -4,6 +4,14 @@ AIML API Provider
 Provider for api.aimlapi.com - unified API for various open source models.
 Supports Llama, Mistral, and other open models with competitive pricing.
 
+CONTENT FILTERING:
+------------------
+Open-source models via AIML API are naturally permissive with no content filtering.
+These models (Llama 3, Llama 3.1 405B, Mixtral, etc.) do not have built-in safety
+filters and will generate adult/mature content without restrictions.
+
+No special parameters needed - models are unrestricted by default.
+
 API Documentation: https://docs.aimlapi.com/
 """
 
@@ -46,6 +54,11 @@ class AIMLAPIProvider(LLMProvider):
 
         self.base_url = "https://api.aimlapi.com/v1"
         self.timeout = 90  # Longer timeout for larger models
+        self.default_model = "meta-llama/Meta-Llama-3-70B-Instruct"
+
+    def get_default_model(self) -> str:
+        """Get default AIML API model."""
+        return self.default_model
 
     def generate(
         self,
@@ -96,6 +109,12 @@ class AIMLAPIProvider(LLMProvider):
             "temperature": temperature,
             "max_tokens": max_tokens
         }
+
+        # Note: AIML API uses open-source models which are naturally permissive
+        # No content filtering parameter needed - models like Llama 3 are unrestricted by default
+        logger.info("Using AIML API open-source model (naturally permissive, no content filtering)")
+
+        print('sending prompt to AIML API (open-source model, no content filters)')
 
         # Add any additional parameters
         for key, value in kwargs.items():

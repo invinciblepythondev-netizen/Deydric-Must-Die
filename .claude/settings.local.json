@@ -10,7 +10,10 @@
       "Bash(./venv/Scripts/python.exe test_flask_app.py)",
       "Bash(./venv/Scripts/python.exe:*)",
       "Bash(dir:*)",
-      "Bash(findstr:*)"
+      "Bash(findstr:*)",
+      "Bash(.\\venv\\Scripts\\python.exe:*)",
+      "Bash(python scripts/test_providers.py:*)",
+      "Bash(nul)"
     ],
     "deny": [],
     "ask": []

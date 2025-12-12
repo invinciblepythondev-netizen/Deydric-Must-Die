@@ -75,7 +75,8 @@ BEGIN
     JOIN character.character c ON c.character_id = th.character_id
     LEFT JOIN world.location l ON l.location_id = th.location_id
     WHERE th.game_state_id = p_game_state_id
-    ORDER BY th.turn_number DESC, th.sequence_number ASC
+      AND th.action_type != 'atmospheric' -- Exclude atmospheric descriptions from context
+    ORDER BY th.turn_number DESC, th.sequence_number DESC
     LIMIT p_last_n_turns * 5; -- Multiply to account for multiple actions per turn
 END;
 $$ LANGUAGE plpgsql;
@@ -108,13 +109,14 @@ BEGIN
     FROM memory.turn_history th
     JOIN character.character c ON c.character_id = th.character_id
     WHERE th.game_state_id = p_game_state_id
+      AND th.action_type != 'atmospheric' -- Exclude atmospheric descriptions from context
       AND (
           -- Character's own actions (including private thoughts)
           th.character_id = p_character_id
           -- OR actions they witnessed (must not be private)
           OR (th.is_private = false AND th.witnesses @> to_jsonb(p_character_id::text))
       )
-    ORDER BY th.turn_number DESC, th.sequence_number ASC
+    ORDER BY th.turn_number DESC, th.sequence_number DESC
     LIMIT p_last_n_turns * 5; -- Account for multiple actions per turn
 END;
 $$ LANGUAGE plpgsql;

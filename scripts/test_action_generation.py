@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.action_sequence import (
     ActionSequence, SingleAction, ActionType, ActionOption,
-    GeneratedActionOptions, MoodCategory, create_simple_action
+    GeneratedActionOptions, create_simple_action
 )
 from models.scene_mood import SceneMood
 from services.action_generator import ActionSelector
@@ -245,7 +245,7 @@ def test_action_options():
         character_id=str(uuid4()),
         turn_number=15,
         options=options,
-        mood_category=MoodCategory.TENSE
+        mood_category='tense'
     )
 
     logger.info(f"Generated {len(options)} action options:")
@@ -284,7 +284,7 @@ def test_ai_selection():
         character_id=str(uuid4()),
         turn_number=1,
         options=options,
-        mood_category=MoodCategory.NEUTRAL
+        mood_category='neutral'
     )
 
     # Run selection 100 times to test distribution
@@ -319,7 +319,7 @@ def test_player_selection():
         character_id=str(uuid4()),
         turn_number=1,
         options=options,
-        mood_category=MoodCategory.NEUTRAL
+        mood_category='neutral'
     )
 
     # Test valid selection
@@ -469,7 +469,7 @@ def demonstrate_full_turn():
         character_id=str(uuid4()),
         turn_number=turn_number,
         options=options,
-        mood_category=MoodCategory.ANTAGONISTIC
+        mood_category='antagonistic'
     )
 
     # Display options

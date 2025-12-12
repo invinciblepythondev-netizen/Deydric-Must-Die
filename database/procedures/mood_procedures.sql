@@ -435,10 +435,16 @@ BEGIN
     FROM game.scene_mood
     WHERE game_state_id = p_game_state_id AND location_id = p_location_id;
 
-    -- Get content settings
-    SELECT * INTO v_content_settings
-    FROM game.content_settings
-    WHERE game_state_id = p_game_state_id;
+    -- Get content settings (handle missing table gracefully)
+    BEGIN
+        SELECT * INTO v_content_settings
+        FROM game.content_settings
+        WHERE game_state_id = p_game_state_id;
+    EXCEPTION
+        WHEN undefined_table THEN
+            -- Table doesn't exist, use NULL (will trigger defaults below)
+            v_content_settings := NULL;
+    END;
 
     -- Default values for neutral mood
     v_should_escalate := FALSE;

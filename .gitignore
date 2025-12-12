@@ -49,3 +49,11 @@ instance/
 
 # Alembic
 alembic/versions/*.pyc
+
+
+character images/
+cahracter images.txt
+
+.claude/settings.local.json
+nul
+

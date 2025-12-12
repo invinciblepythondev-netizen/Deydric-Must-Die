@@ -3,6 +3,7 @@ Objective Manager Service
 Handles CRUD operations and state management for character objectives.
 """
 
+import json
 from typing import List, Dict, Optional, Any
 from uuid import UUID
 from datetime import datetime
@@ -41,15 +42,15 @@ class ObjectiveManager:
             text("""
                 SELECT objective.character_objective_upsert(
                     NULL, :character_id, :game_id, :parent_objective_id,
-                    :objective_type::objective.objective_type,
+                    CAST(:objective_type AS objective.objective_type),
                     :description, :success_criteria,
-                    :priority::objective.priority_level,
+                    CAST(:priority AS objective.priority_level),
                     'active'::objective.objective_status,
-                    :source::objective.objective_source,
+                    CAST(:source AS objective.objective_source),
                     :delegated_from_character_id, :delegated_to_character_id,
                     :confirmation_required,
                     :deadline_soft, :deadline_hard, :current_turn,
-                    :decay_after_turns, :is_atomic, :metadata::jsonb,
+                    :decay_after_turns, :is_atomic, CAST(:metadata AS jsonb),
                     :mood_impact_positive, :mood_impact_negative
                 ) as objective_id
             """),
@@ -70,7 +71,7 @@ class ObjectiveManager:
                 "current_turn": current_turn,
                 "decay_after_turns": decay_after_turns,
                 "is_atomic": is_atomic,
-                "metadata": metadata or {},
+                "metadata": json.dumps(metadata or {}),
                 "mood_impact_positive": mood_impact_positive,
                 "mood_impact_negative": mood_impact_negative
             }
@@ -79,6 +80,9 @@ class ObjectiveManager:
         objective_id = result.scalar()
         db.session.commit()
 
+        # The stored procedure already returns a UUID
+        if isinstance(objective_id, UUID):
+            return objective_id
         return UUID(objective_id)
 
     @staticmethod
@@ -109,8 +113,8 @@ class ObjectiveManager:
             text("""
                 SELECT * FROM objective.character_objectives_list(
                     :character_id,
-                    :status::objective.objective_status,
-                    :priority::objective.priority_level,
+                    CAST(:status AS objective.objective_status),
+                    CAST(:priority AS objective.priority_level),
                     :parent_objective_id,
                     :include_children
                 )
@@ -149,7 +153,7 @@ class ObjectiveManager:
             text("""
                 SELECT objective.character_objective_update_status(
                     :objective_id,
-                    :new_status::objective.objective_status,
+                    CAST(:new_status AS objective.objective_status),
                     :completed_turn
                 )
             """),

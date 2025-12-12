@@ -67,10 +67,13 @@ class ModelContextLimits:
         "mistralai/Mixtral-8x7B-Instruct-v0.1": 32768,
         "meta-llama/Meta-Llama-3-70B-Instruct": 8192,
         "meta-llama/Meta-Llama-3.1-405B-Instruct": 131072,
+        "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": 131072,
+        "meta-llama/Llama-3.1-405B-Instruct-Turbo": 131072,
 
         # Together.ai
         "mistralai/Mixtral-8x7B-Instruct-v0.1": 32768,
         "meta-llama/Llama-3-70b-chat-hf": 8192,
+        "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": 131072,
 
         # Local models
         "llama-3-70b-instruct": 8192,
@@ -150,6 +153,53 @@ def estimate_tokens(text: str, model: str = "gpt-4") -> int:
     except Exception as e:
         logger.warning(f"Token counting error: {e}, using rough estimate")
         return len(text) // 4
+
+
+def calculate_max_tokens(
+    model: str,
+    input_tokens: int,
+    safety_margin: float = 0.9,
+    min_output: int = 512,
+    max_output: int = 3000
+) -> int:
+    """
+    Calculate appropriate max_tokens for a model given input size.
+
+    Args:
+        model: Model identifier
+        input_tokens: Number of tokens in the input
+        safety_margin: Use this % of remaining space (default 90%)
+        min_output: Minimum output tokens to allow
+        max_output: Maximum output tokens to cap at
+
+    Returns:
+        Recommended max_tokens value
+    """
+    # Get model's total context limit
+    total_limit = ModelContextLimits.get_limit(model)
+
+    # Calculate available space for output
+    available = total_limit - input_tokens
+
+    if available <= 0:
+        logger.error(
+            f"Input ({input_tokens} tokens) exceeds model limit ({total_limit} tokens)!"
+        )
+        return min_output
+
+    # Apply safety margin
+    safe_available = int(available * safety_margin)
+
+    # Clamp to reasonable range
+    result = max(min_output, min(safe_available, max_output))
+
+    logger.debug(
+        f"Calculated max_tokens for {model}: "
+        f"input={input_tokens}, limit={total_limit}, "
+        f"available={available}, result={result}"
+    )
+
+    return result
 
 
 class ContextAssembler:
@@ -694,7 +744,19 @@ def build_character_context(
     # Location information
     situation_parts.append(f"Current location: {game_context.get('location_name')}")
     situation_parts.append(f"Location description: {game_context.get('location_description')}")
-    situation_parts.append(f"Present characters: {', '.join(game_context.get('visible_characters', []))}")
+
+    # Format visible characters - handle both list of strings and list of dicts
+    visible_chars = game_context.get('visible_characters', [])
+    if visible_chars:
+        if isinstance(visible_chars[0], dict):
+            # List of character dicts - extract names
+            char_names = [char.get('name', 'Unknown') for char in visible_chars]
+            situation_parts.append(f"Present characters: {', '.join(char_names)}")
+        else:
+            # List of strings (legacy format)
+            situation_parts.append(f"Present characters: {', '.join(visible_chars)}")
+    else:
+        situation_parts.append("Present characters: None")
 
     assembler.add_component(
         name="current_situation",

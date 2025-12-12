@@ -6,19 +6,21 @@ Uses LLM to create, break down, and re-evaluate character objectives.
 from typing import List, Dict, Optional, Any
 from uuid import UUID
 import json
-from services.llm.provider import LLMProvider
+from services.llm_service import get_unified_llm_service
 from services.objective_manager import ObjectiveManager, CognitiveTraitManager
-from services.context_assembler import ContextAssembler
 
 
 class ObjectivePlanner:
     """
-    LLM-driven objective planning and breakdown.
+    LLM-driven objective planning and breakdown with resilient fallback.
     Generates child objectives, re-evaluates priorities, and adapts plans.
+
+    Now uses UnifiedLLMService for automatic fallback to manual input.
     """
 
-    def __init__(self, llm_provider: LLMProvider):
-        self.llm = llm_provider
+    def __init__(self):
+        """Initialize planner with unified LLM service."""
+        self.llm_service = get_unified_llm_service()
         self.objective_manager = ObjectiveManager()
         self.trait_manager = CognitiveTraitManager()
 
@@ -54,17 +56,17 @@ class ObjectivePlanner:
         """
         Generate initial main objectives for a character based on their profile.
         Called during character creation.
+
+        Uses UnifiedLLMService with automatic fallback to manual input.
         """
 
-        prompt = self._build_initial_objectives_prompt(character_profile)
+        planning_context = self._build_initial_objectives_context(character_profile)
 
-        response = self.llm.generate(
-            system_prompt="You are a game AI that generates character objectives.",
-            user_prompt=prompt,
-            response_format="json"
+        # Use unified service (with automatic fallback)
+        objectives_data = self.llm_service.plan_objectives(
+            character_profile=character_profile,
+            planning_context=planning_context
         )
-
-        objectives_data = json.loads(response)
         created_ids = []
 
         for obj_data in objectives_data.get('objectives', []):
@@ -114,9 +116,9 @@ class ObjectivePlanner:
         prompt = self._build_breakdown_prompt(objective, character_profile, context)
 
         response = self.llm.generate(
-            system_prompt="You are a game AI that breaks down objectives into actionable steps.",
-            user_prompt=prompt,
-            response_format="json"
+            prompt=prompt,
+            system_prompt="You are a game AI that breaks down objectives into actionable steps. Always respond with valid JSON.",
+            temperature=0.7
         )
 
         breakdown_data = json.loads(response)
@@ -184,9 +186,9 @@ class ObjectivePlanner:
         )
 
         response = self.llm.generate(
-            system_prompt="You are a game AI that evaluates and adjusts character objectives.",
-            user_prompt=prompt,
-            response_format="json"
+            prompt=prompt,
+            system_prompt="You are a game AI that evaluates and adjusts character objectives. Always respond with valid JSON.",
+            temperature=0.7
         )
 
         evaluation_data = json.loads(response)
@@ -253,9 +255,9 @@ class ObjectivePlanner:
         prompt = self._build_interaction_objective_prompt(interaction_context)
 
         response = self.llm.generate(
-            system_prompt="You are a game AI that creates objectives from character interactions.",
-            user_prompt=prompt,
-            response_format="json"
+            prompt=prompt,
+            system_prompt="You are a game AI that creates objectives from character interactions. Always respond with valid JSON.",
+            temperature=0.7
         )
 
         obj_data = json.loads(response)
@@ -280,7 +282,15 @@ class ObjectivePlanner:
         return objective_id
 
     # =========================================================================
-    # Prompt Building
+    # Context Building (for UnifiedLLMService)
+    # =========================================================================
+
+    def _build_initial_objectives_context(self, character_profile: Dict) -> str:
+        """Build context string for initial objectives planning."""
+        return f"""Character is being initialized. Create 2-4 main objectives based on their profile and motivations."""
+
+    # =========================================================================
+    # Prompt Building (Legacy - kept for backwards compatibility)
     # =========================================================================
 
     def _build_initial_objectives_prompt(self, character_profile: Dict) -> str:

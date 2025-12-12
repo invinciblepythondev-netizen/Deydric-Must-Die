@@ -87,32 +87,37 @@ class ProviderCapability:
             }
         },
         "together_ai": {
-            "mistral-8x7b": {
+            "mistralai/Mixtral-8x7B-Instruct-v0.1": {
                 "max_intensity": ContentIntensity.MATURE,
-                "notes": "API access to open models. More permissive.",
+                "notes": "API access to open models. More permissive. No content filtering.",
                 "cost_per_1k_tokens": 0.0006
             },
-            "llama-3-70b": {
+            "meta-llama/Llama-3-70b-chat-hf": {
                 "max_intensity": ContentIntensity.UNRESTRICTED,
-                "notes": "Large open model via API. Very permissive.",
+                "notes": "Large open model via API. Very permissive. No content filtering.",
                 "cost_per_1k_tokens": 0.0009
+            },
+            "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": {
+                "max_intensity": ContentIntensity.UNRESTRICTED,
+                "notes": "Largest open model via Together AI. Most permissive, highest quality. No content filtering.",
+                "cost_per_1k_tokens": 0.005
             }
         },
         "aimlapi": {
-            "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-                "max_intensity": ContentIntensity.MATURE,
-                "notes": "AIML API - Mixtral access. More permissive than mainstream.",
-                "cost_per_1k_tokens": 0.0005
+            "meta-llama/Llama-3.1-405B-Instruct-Turbo": {
+                "max_intensity": ContentIntensity.UNRESTRICTED,
+                "notes": "AIML API - Llama 3.1 405B. Highest quality open model, very permissive.",
+                "cost_per_1k_tokens": 0.0027
             },
-            "meta-llama/Meta-Llama-3-70B-Instruct": {
+            "meta-llama/Llama-3-70b-chat-hf": {
                 "max_intensity": ContentIntensity.UNRESTRICTED,
                 "notes": "AIML API - Llama 3 70B. Very permissive, good quality.",
                 "cost_per_1k_tokens": 0.0008
             },
-            "meta-llama/Meta-Llama-3.1-405B-Instruct": {
-                "max_intensity": ContentIntensity.UNRESTRICTED,
-                "notes": "AIML API - Llama 3.1 405B. Highest quality open model, very permissive.",
-                "cost_per_1k_tokens": 0.0027
+            "mistralai/Mixtral-8x7B-Instruct-v0.1": {
+                "max_intensity": ContentIntensity.MATURE,
+                "notes": "AIML API - Mixtral access. More permissive than mainstream.",
+                "cost_per_1k_tokens": 0.0005
             },
             "mistralai/Mistral-7B-Instruct-v0.2": {
                 "max_intensity": ContentIntensity.MODERATE,
