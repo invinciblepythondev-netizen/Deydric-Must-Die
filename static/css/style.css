@@ -500,6 +500,41 @@ footer {
     font-style: italic;
 }
 
+/* Visual feedback for selected actions */
+.history-item.selected-action {
+    animation: fadeIn 0.5s ease-in;
+    background-color: #3a3a2a;
+    border-left: 3px solid #d4a574;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.action-selected-message {
+    color: #90d490;
+    font-size: 1.2rem;
+    text-align: center;
+    padding: 2rem;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.6;
+    }
+}
+
 /* Responsive design */
 @media (max-width: 768px) {
     .game-container {

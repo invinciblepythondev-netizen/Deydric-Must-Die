@@ -232,10 +232,64 @@
         }
     }
 
+    // Add action to history
+    function addActionToHistory(actionData) {
+        const historyList = document.querySelector('.history-list');
+        const historyItem = document.createElement('div');
+        historyItem.className = 'history-item selected-action';
+
+        let content = `
+            <span class="turn-badge">Turn ${actionData.turn_number}</span>
+            <span class="character-name">${escapeHtml(actionData.character_name)}:</span>
+        `;
+
+        if (actionData.thought && actionData.thought.trim()) {
+            content += `<p class="action-text thought-action"><em>${escapeHtml(actionData.thought)}</em></p>`;
+        }
+
+        if (actionData.dialogue && actionData.dialogue.trim()) {
+            content += `<p class="action-text speech-action">"${escapeHtml(actionData.dialogue)}"</p>`;
+        }
+
+        if (actionData.action && actionData.action.trim()) {
+            content += `<p class="action-text">${escapeHtml(actionData.action)}</p>`;
+        }
+
+        historyItem.innerHTML = content;
+        historyList.appendChild(historyItem);
+
+        // Scroll to bottom
+        scrollHistoryToBottom();
+
+        return historyItem;
+    }
+
+    // Add atmospheric text to history
+    function addAtmosphericToHistory(atmosphericText, turnNumber) {
+        if (!atmosphericText || !atmosphericText.trim()) return;
+
+        const historyList = document.querySelector('.history-list');
+        const atmosphericItem = document.createElement('div');
+        atmosphericItem.className = 'history-item atmospheric';
+        atmosphericItem.innerHTML = `<p class="action-text atmospheric-text">${escapeHtml(atmosphericText)}</p>`;
+
+        historyList.appendChild(atmosphericItem);
+
+        // Scroll to bottom
+        scrollHistoryToBottom();
+    }
+
     // Select and execute player action
     async function selectAction(actionIndex, actions) {
         const selectedAction = actions[actionIndex];
         const loadingDiv = document.getElementById('loading');
+        const actionOptions = document.getElementById('action-options');
+
+        // Clear action list and show visual cue
+        document.getElementById('actions-list').innerHTML = '<p class="action-selected-message">✓ Action selected! Processing...</p>';
+
+        // Disable all action buttons
+        document.querySelectorAll('.select-action-btn').forEach(btn => btn.disabled = true);
 
         loadingDiv.style.display = 'block';
 
@@ -257,20 +311,32 @@
 
             const result = await response.json();
 
-            if (result.success) {
-                // Hide player action options, show AI turn section
-                document.getElementById('action-options').style.display = 'none';
+            if (result.success && result.action_data) {
+                // Immediately add the selected action to history
+                addActionToHistory(result.action_data);
+
+                // Add atmospheric text if available
+                if (result.action_data.atmospheric) {
+                    addAtmosphericToHistory(result.action_data.atmospheric, result.action_data.turn_number);
+                }
+
+                // Clear the action options
+                actionOptions.style.display = 'none';
                 document.getElementById('ai-turn-section').style.display = 'block';
 
                 // Automatically execute AI turn
                 await executeAITurn();
             } else {
                 loadingDiv.style.display = 'none';
-                alert('Error: ' + result.error);
+                alert('Error: ' + (result.error || 'Unknown error'));
+                // Re-enable buttons
+                document.querySelectorAll('.select-action-btn').forEach(btn => btn.disabled = false);
             }
         } catch (error) {
             loadingDiv.style.display = 'none';
             alert('Error: ' + error.message);
+            // Re-enable buttons
+            document.querySelectorAll('.select-action-btn').forEach(btn => btn.disabled = false);
         }
     }
 

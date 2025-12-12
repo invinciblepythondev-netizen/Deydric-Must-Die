@@ -248,7 +248,7 @@ def index():
                 visible_history.append({
                     'turn_number': h[0],
                     'sequence_number': h[1],
-                    'character_name': h[2] if not is_atmospheric else '',
+                    'character_name': h[2],  # Keep character name even for atmospheric (for grouping)
                     'action_type': action_type,
                     'action_description': h[4],
                     'is_private': is_private and not is_players_action,  # Show as private only if it's not the player's
@@ -807,7 +807,18 @@ def take_action():
             traceback.print_exc()
             # Don't fail the turn if mood adjustment fails
 
-        return jsonify({'success': True, 'turn': current_turn + 1})
+        return jsonify({
+            'success': True,
+            'turn': current_turn + 1,
+            'action_data': {
+                'turn_number': current_turn,
+                'character_name': player_name,
+                'thought': thought_text,
+                'dialogue': dialogue_text,
+                'action': action_text,
+                'atmospheric': atmos_desc if 'atmos_desc' in locals() else ''
+            }
+        })
 
     except Exception as e:
         db.session.rollback()
