@@ -9,11 +9,266 @@ from sqlalchemy import text
 from database import db
 from services.llm_service import get_unified_llm_service
 import json
-from uuid import uuid4
+from uuid import uuid4, UUID
 import logging
 
 logger = logging.getLogger(__name__)
 game_bp = Blueprint('game', __name__, url_prefix='/game')
+
+# Initialize item system (lazy initialization)
+_item_parser = None
+_item_generator = None
+_item_store = None
+_item_context_helper = None
+
+def get_item_parser():
+    """Get or initialize ItemActionParser."""
+    global _item_parser
+    if _item_parser is None:
+        try:
+            from services.item_store import ItemStore
+            from services.item_action_parser import ItemActionParser
+            item_store = ItemStore()
+            _item_parser = ItemActionParser(item_store)
+            logger.info("✓ ItemActionParser initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize ItemActionParser: {e}")
+            _item_parser = False  # Mark as failed
+    return _item_parser if _item_parser is not False else None
+
+def get_item_generator():
+    """Get or initialize ItemGenerator."""
+    global _item_generator
+    if _item_generator is None:
+        try:
+            from services.item_generator import ItemGenerator
+            from services.llm_service import get_unified_llm_service
+            llm_service = get_unified_llm_service()
+            resilient_generator = llm_service.factory.get_action_generator()
+            _item_generator = ItemGenerator(resilient_generator)
+            logger.info("✓ ItemGenerator initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize ItemGenerator: {e}")
+            _item_generator = False
+
+def get_item_store():
+    """Get or initialize ItemStore."""
+    global _item_store
+    if _item_store is None:
+        try:
+            from services.item_store import ItemStore
+            _item_store = ItemStore()
+            logger.info("✓ ItemStore initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize ItemStore: {e}")
+            _item_store = False
+    return _item_store if _item_store is not False else None
+
+def get_item_context_helper():
+    """Get or initialize ItemContextHelper."""
+    global _item_context_helper
+    if _item_context_helper is None:
+        try:
+            from services.item_context_helper import ItemContextHelper
+            item_store = get_item_store()
+            if item_store:
+                _item_context_helper = ItemContextHelper(item_store)
+                logger.info("✓ ItemContextHelper initialized")
+            else:
+                _item_context_helper = False
+        except Exception as e:
+            logger.warning(f"Could not initialize ItemContextHelper: {e}")
+            _item_context_helper = False
+    return _item_context_helper if _item_context_helper is not False else None
+
+def process_item_changes(action_description, character_id, location_id, current_turn):
+    """
+    Parse action description and apply item state changes.
+
+    Also handles lazy container generation if a container is opened,
+    and generates hidden items if a search action is performed.
+
+    Args:
+        action_description: Text description of the action
+        character_id: Character who performed the action
+        location_id: Location where action took place
+        current_turn: Current turn number
+
+    Returns:
+        List of applied item changes
+    """
+    item_parser = get_item_parser()
+    if not item_parser:
+        return []
+
+    try:
+        # Parse and apply item changes
+        applied_changes = item_parser.parse_and_apply(
+            action_outcome=action_description,
+            character_id=UUID(character_id) if isinstance(character_id, str) else character_id,
+            location_id=location_id,
+            current_turn=current_turn
+        )
+
+        if applied_changes:
+            logger.info(f"Applied {len(applied_changes)} item changes for turn {current_turn}")
+
+            # Check if any containers need content generation (lazy generation)
+            for change in applied_changes:
+                if change.get('needs_contents_generation'):
+                    generate_container_contents(
+                        container_id=change['item_id'],
+                        location_id=location_id,
+                        current_turn=current_turn
+                    )
+
+                # Check if search action requires generating hidden items
+                if change.get('needs_searchable_items_generation'):
+                    generate_searchable_items(
+                        location_id=change['location_id'],
+                        current_turn=current_turn
+                    )
+
+        return applied_changes
+
+    except Exception as e:
+        logger.error(f"Error processing item changes: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def generate_container_contents(container_id, location_id, current_turn):
+    """
+    Generate contents for a container that was just opened (lazy generation).
+
+    Args:
+        container_id: UUID of container (as string)
+        location_id: Location ID
+        current_turn: Current turn number
+    """
+    item_generator = get_item_generator()
+    if not item_generator:
+        logger.warning("Cannot generate container contents: ItemGenerator unavailable")
+        return
+
+    try:
+        from services.item_store import ItemStore
+        item_store = ItemStore()
+
+        container = item_store.get_item(UUID(container_id))
+        if not container:
+            logger.error(f"Container {container_id} not found")
+            return
+
+        # Get location info for context
+        location = db.session.execute(
+            text("SELECT * FROM location_get(:id)"),
+            {"id": location_id}
+        ).fetchone()
+
+        if not location:
+            logger.error(f"Location {location_id} not found")
+            return
+
+        logger.info(f"Generating contents for container: {container['item_name']}")
+
+        # Generate contents
+        contents = item_generator.generate_container_contents(
+            container_name=container['item_name'],
+            container_description=container['item_description'],
+            container_capacity=container['capacity'],
+            location_name=location.name,
+            location_description=location.description,
+            container_id=UUID(container_id),
+            max_items=10,
+            created_turn=current_turn
+        )
+
+        # Store contents
+        for item_data in contents:
+            item_store.add_item(**item_data)
+
+        # Mark container as generated
+        item_store.update_item(UUID(container_id), contents_generated=True)
+
+        logger.info(f"✓ Generated {len(contents)} items in {container['item_name']}")
+
+    except Exception as e:
+        logger.error(f"Error generating container contents: {e}")
+        import traceback
+        traceback.print_exc()
+
+def generate_searchable_items(location_id, current_turn):
+    """
+    Generate hidden/searchable items for a location when a search action is performed.
+
+    Args:
+        location_id: Location ID where search is happening
+        current_turn: Current turn number
+    """
+    item_generator = get_item_generator()
+    if not item_generator:
+        logger.warning("Cannot generate searchable items: ItemGenerator unavailable")
+        return
+
+    try:
+        from services.item_store import ItemStore
+        item_store = ItemStore()
+
+        # Check if searchable items have already been generated for this location
+        # by looking for hidden items at this location
+        existing_hidden = item_store.search_items(
+            location_id=location_id,
+            visibility_levels=["hidden"],
+            limit=1
+        )
+
+        if existing_hidden:
+            logger.info(f"Searchable items already generated for location {location_id}, skipping")
+            # Make hidden items visible (they've been found!)
+            all_hidden = item_store.search_items(
+                location_id=location_id,
+                visibility_levels=["hidden"]
+            )
+            for item in all_hidden:
+                item_store.update_item(
+                    UUID(item['item_id']),
+                    visibility_level='visible'
+                )
+            logger.info(f"✓ Made {len(all_hidden)} hidden items visible")
+            return
+
+        # Get location info for context
+        location = db.session.execute(
+            text("SELECT * FROM location_get(:id)"),
+            {"id": location_id}
+        ).fetchone()
+
+        if not location:
+            logger.error(f"Location {location_id} not found")
+            return
+
+        logger.info(f"Generating searchable items for location: {location.name}")
+
+        # Generate hidden items
+        searchable_items = item_generator.generate_searchable_items(
+            location_name=location.name,
+            location_description=location.description,
+            location_id=location_id,
+            max_items=5,
+            created_turn=current_turn
+        )
+
+        # Store searchable items
+        for item_data in searchable_items:
+            item_store.add_item(**item_data)
+
+        logger.info(f"✓ Generated {len(searchable_items)} searchable items in {location.name}")
+
+    except Exception as e:
+        logger.error(f"Error generating searchable items: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def generate_atmospheric_description(character_name, action_description, location_name, location_description, other_characters, recent_history, current_stance=None, current_clothing=None):
@@ -36,6 +291,7 @@ def generate_atmospheric_description(character_name, action_description, locatio
             character_name=character_name,
             action_description=action_description,
             location_name=location_name,
+            location_description=location_description,
             other_characters=other_characters,
             recent_history=recent_history,
             current_stance=current_stance,
@@ -58,90 +314,91 @@ def generate_atmospheric_description(character_name, action_description, locatio
 
 def create_memory_summary(game_id, current_turn):
     """
-    Create a memory summary for the last 10 turns.
+    Create tiered memory summaries for all characters.
 
-    Uses resilient generator with automatic fallback for adult content
-    (violence, sexual themes, disturbing content).
+    Generates summaries at multiple time windows (10, 50, 100, 720 turns, etc.)
+    with both descriptive (for large models) and condensed (for small models) versions.
+
+    Uses resilient generator with automatic fallback for adult content.
     """
-    from uuid import uuid4
     from services.llm_service import get_unified_llm_service
-    from services.llm.resilient_generator import AllProvidersFailedError
+    from services.memory_summarizer import MemorySummarizer
 
     try:
-        # Get turns to summarize (last 10 turns)
-        start_turn = max(1, current_turn - 9)
-        end_turn = current_turn
+        logger.info(f"[Memory Summary] Starting summary generation for turn {current_turn}")
 
-        # Fetch turn history
-        turns = db.session.execute(
-            text("""
-                SELECT
-                    th.turn_number,
-                    c.name as character_name,
-                    th.action_type,
-                    th.action_description,
-                    th.sequence_number
-                FROM memory.turn_history th
-                JOIN character.character c ON th.character_id = c.character_id
-                WHERE th.game_state_id = :game_id
-                    AND th.turn_number >= :start_turn
-                    AND th.turn_number <= :end_turn
-                    AND th.action_type != 'atmospheric'
-                ORDER BY th.turn_number ASC, th.sequence_number ASC
-            """),
-            {"game_id": str(game_id), "start_turn": start_turn, "end_turn": end_turn}
-        ).fetchall()
-
-        if not turns:
-            logger.warning(f"No turns found for summarization (turns {start_turn}-{end_turn})")
-            return
-
-        # Format turns for summarization
-        turn_data = []
-        for turn in turns:
-            turn_data.append({
-                'turn_number': turn[0],
-                'action_description': f"{turn[1]} ({turn[2]}): {turn[3]}"
-            })
-
-        # Generate summary using resilient generator (handles adult content with fallback)
+        # Get LLM provider for summarization
         llm_service = get_unified_llm_service()
-        resilient_generator = llm_service.factory.get_action_generator()
+        llm_provider = llm_service.factory.get_action_generator()
 
-        # Use resilient generator's summarize_memory method
-        # This automatically classifies content intensity and uses appropriate provider chain
-        summary = resilient_generator.summarize_memory(turn_data, importance="routine")
+        # Initialize vector store for embedding summaries
+        from services.vector_store import VectorStoreService
+        try:
+            vector_store = VectorStoreService(collection_name="game_memories")
+            logger.info("✓ Vector store initialized for summary embeddings")
+        except Exception as e:
+            logger.warning(f"Could not initialize vector store: {e}. Summaries will not be embedded.")
+            vector_store = None
 
-        # Store summary in database
-        summary_id = uuid4()
-        db.session.execute(
+        # Initialize summarizer with vector store
+        summarizer = MemorySummarizer(llm_provider, vector_store=vector_store)
+
+        # Get all characters in the game
+        characters = db.session.execute(
             text("""
-                INSERT INTO memory.memory_summary (
-                    summary_id, game_state_id, start_turn, end_turn,
-                    summary_text, importance, created_at
-                ) VALUES (
-                    :summary_id, :game_id, :start_turn, :end_turn,
-                    :summary_text, :importance, NOW()
+                SELECT DISTINCT character_id, name
+                FROM character.character
+                WHERE character_id IN (
+                    SELECT DISTINCT character_id
+                    FROM memory.turn_history
+                    WHERE game_state_id = :game_id
                 )
             """),
-            {
-                "summary_id": str(summary_id),
-                "game_id": str(game_id),
-                "start_turn": start_turn,
-                "end_turn": end_turn,
-                "summary_text": summary,
-                "importance": "routine"
-            }
-        )
-        db.session.commit()
+            {"game_id": str(game_id)}
+        ).fetchall()
 
-        logger.info(f"Created memory summary {summary_id} for turns {start_turn}-{end_turn}")
+        if not characters:
+            logger.warning("No characters found for summary generation")
+            return
 
-    except AllProvidersFailedError as e:
-        logger.error(f"All providers failed for memory summarization: {e}")
-        # Don't raise - let the game continue without summary
+        logger.info(f"[Memory Summary] Generating summaries for {len(characters)} characters")
+
+        # Generate summaries for each character
+        total_generated = 0
+        for char_id, char_name in characters:
+            try:
+                results = summarizer.generate_summaries_for_character(
+                    db_session=db.session,
+                    game_state_id=game_id,
+                    character_id=char_id,
+                    current_turn=current_turn
+                )
+
+                generated_count = len(results['generated'])
+                total_generated += generated_count
+
+                if generated_count > 0:
+                    logger.info(f"[Memory Summary] {char_name}: Generated {generated_count} summaries")
+                    for summary_info in results['generated']:
+                        logger.info(
+                            f"  - {summary_info['window_type']}: {summary_info['turn_range']} "
+                            f"(desc: {summary_info['descriptive_len']}ch, cond: {summary_info['condensed_len']}ch)"
+                        )
+
+                if results['errors']:
+                    for error in results['errors']:
+                        logger.error(f"  - Error in {error['window_type']}: {error['error']}")
+
+            except Exception as e:
+                logger.error(f"[Memory Summary] Error generating summaries for {char_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue with next character
+
+        logger.info(f"[Memory Summary] Complete! Generated {total_generated} total summaries for {len(characters)} characters")
+
     except Exception as e:
-        logger.error(f"Error creating memory summary: {e}")
+        logger.error(f"[Memory Summary] Fatal error in summary generation: {e}")
         import traceback
         traceback.print_exc()
         # Don't raise - let the game continue without summary
@@ -410,31 +667,28 @@ def get_actions():
             num_options=5
         )
 
-        # Parse actions for frontend
+        # Parse actions for frontend - preserve full action sequences
         parsed_actions = []
         for option in generated_options.options:
-            # Combine multi-action sequences into single display format
-            thought_parts = []
-            dialogue_parts = []
-            action_parts = []
-
+            # Send full action sequence without combining
+            action_sequence = []
             for action in option.sequence.actions:
-                if action.action_type.value == 'think':
-                    thought_parts.append(action.description)
-                elif action.action_type.value == 'speak':
-                    dialogue_parts.append(action.description)
-                else:
-                    action_parts.append(action.description)
+                action_sequence.append({
+                    'type': action.action_type.value,
+                    'description': action.description,
+                    'is_private': action.is_private
+                })
 
             parsed_actions.append({
                 'option_id': option.option_id,
                 'summary': option.sequence.summary,
                 'emotional_tone': option.sequence.emotional_tone,
-                'private_thought': ' '.join(thought_parts),
-                'dialogue': ' '.join(dialogue_parts),
-                'action': ' '.join(action_parts),
+                'actions': action_sequence,  # Full sequence array
                 'escalates': option.sequence.escalates_mood,
-                'deescalates': option.sequence.deescalates_mood
+                'deescalates': option.sequence.deescalates_mood,
+                'turn_duration': option.sequence.turn_duration,
+                'current_stance': option.sequence.current_stance,
+                'current_clothing': option.sequence.current_clothing
             })
 
         return jsonify({
@@ -454,10 +708,32 @@ def take_action():
     """Execute a player action."""
     try:
         data = request.get_json()
-        thought_text = data.get('thought', '')
-        dialogue_text = data.get('dialogue', '')
-        action_text = data.get('action', '')
-        emotional_tone = data.get('emotional_tone', '')
+        print(f"\n📥 RECEIVED PLAYER ACTION DATA:")
+        print(f"   Raw data: {data}")
+
+        # Get action sequence array (new format) or fallback to old format
+        actions = data.get('actions', [])
+        emotional_tone = data.get('emotional_tone', 'neutral')
+        current_stance = data.get('current_stance', 'standing')
+        current_clothing = data.get('current_clothing', 'unchanged')
+        turn_duration = data.get('turn_duration', 1)
+
+        # Fallback to old format if actions array not provided
+        if not actions:
+            actions = []
+            if data.get('thought'):
+                actions.append({'type': 'think', 'description': data['thought'], 'is_private': True})
+            if data.get('dialogue'):
+                actions.append({'type': 'speak', 'description': data['dialogue'], 'is_private': False})
+            if data.get('action'):
+                actions.append({'type': 'action', 'description': data['action'], 'is_private': False})
+
+        print(f"   Extracted values:")
+        print(f"      actions: {len(actions)} actions in sequence")
+        print(f"      emotional_tone: {emotional_tone}")
+        print(f"      current_stance: {current_stance}")
+        print(f"      current_clothing: {current_clothing}")
+        print(f"      turn_duration: {turn_duration}")
 
         # Get game and player info
         game = db.session.execute(
@@ -482,6 +758,48 @@ def take_action():
         location_id = player_char[1]
         player_name = player_char[2]
 
+        # Update character state (emotional state, stance, clothing)
+        print(f"\n🔄 PLAYER CHARACTER STATE UPDATE:")
+        print(f"   Character ID: {player_id}")
+        print(f"   Emotional Tone: {emotional_tone}")
+        print(f"   Current Stance: {current_stance}")
+        print(f"   Current Clothing: {current_clothing}")
+        print(f"   Turn Duration: {turn_duration}")
+
+        if emotional_tone or current_stance != 'standing' or current_clothing != 'unchanged':
+            print(f"   ✅ Calling character_update_state()...")
+            result = db.session.execute(
+                text("SELECT character_update_state(:char_id, :emotional, :stance, :clothing)"),
+                {
+                    "char_id": str(player_id),
+                    "emotional": emotional_tone if emotional_tone else None,
+                    "stance": current_stance if current_stance != 'unchanged' else None,
+                    "clothing": current_clothing if current_clothing != 'unchanged' else None
+                }
+            )
+            print(f"   ✅ character_update_state() called, result: {result.fetchone()}")
+
+            # Verify the update
+            verify = db.session.execute(
+                text("""
+                    SELECT name, current_emotional_state, current_stance, current_clothing
+                    FROM character.character
+                    WHERE character_id = :char_id
+                """),
+                {"char_id": str(player_id)}
+            ).fetchone()
+            print(f"   📊 Verification - Character state after update:")
+            print(f"      Name: {verify[0]}")
+            print(f"      Emotional State: {verify[1]}")
+            print(f"      Stance: {verify[2]}")
+            print(f"      Clothing: {verify[3]}")
+        else:
+            print(f"   ⚠️ Skipping update - all values are defaults")
+
+        # Calculate remaining duration (turn_duration - 1 since we're completing first turn)
+        remaining_duration = max(0, turn_duration - 1)
+        print(f"   Remaining Duration: {remaining_duration}\n")
+
         # Get other characters in location (potential witnesses)
         others = db.session.execute(
             text("""
@@ -499,86 +817,55 @@ def take_action():
         from uuid import uuid4
         sequence = 0
 
-        # Insert thought (private action) if provided
-        if thought_text:
-            db.session.execute(
-                text("""
-                    INSERT INTO memory.turn_history (
-                        turn_id, game_state_id, turn_number,
-                        character_id, sequence_number, action_type,
-                        action_description, location_id, is_private, witnesses
-                    ) VALUES (
-                        :turn_id, :game_id, :turn_num,
-                        :char_id, :seq, 'think',
-                        :thought, :loc_id, TRUE, CAST(:witnesses AS jsonb)
-                    )
-                """),
-                {
-                    "turn_id": str(uuid4()),
-                    "game_id": str(game_id),
-                    "turn_num": current_turn + 1,
-                    "char_id": str(player_id),
-                    "seq": sequence,
-                    "thought": thought_text,
-                    "loc_id": location_id,
-                    "witnesses": f'["{player_id}"]'  # Only player knows their thoughts
-                }
-            )
-            sequence += 1
+        # Insert each action in the sequence with proper sequence numbers
+        for action in actions:
+            action_type = action.get('type', 'action')
+            description = action.get('description', '')
+            is_private = action.get('is_private', False)
 
-        # Insert dialogue (public) if provided
-        if dialogue_text:
-            db.session.execute(
-                text("""
-                    INSERT INTO memory.turn_history (
-                        turn_id, game_state_id, turn_number,
-                        character_id, sequence_number, action_type,
-                        action_description, location_id, is_private, witnesses
-                    ) VALUES (
-                        :turn_id, :game_id, :turn_num,
-                        :char_id, :seq, 'speak',
-                        :dialogue, :loc_id, FALSE, CAST(:witnesses AS jsonb)
-                    )
-                """),
-                {
-                    "turn_id": str(uuid4()),
-                    "game_id": str(game_id),
-                    "turn_num": current_turn + 1,
-                    "char_id": str(player_id),
-                    "seq": sequence,
-                    "dialogue": dialogue_text,
-                    "loc_id": location_id,
-                    "witnesses": witnesses_json
-                }
-            )
-            sequence += 1
+            # Determine witnesses based on privacy
+            action_witnesses = f'["{player_id}"]' if is_private else witnesses_json
 
-        # Insert physical action (public) if provided
-        if action_text:
-            db.session.execute(
-                text("""
-                    INSERT INTO memory.turn_history (
-                        turn_id, game_state_id, turn_number,
-                        character_id, sequence_number, action_type,
-                        action_description, location_id, is_private, witnesses
-                    ) VALUES (
-                        :turn_id, :game_id, :turn_num,
-                        :char_id, :seq, 'action',
-                        :action, :loc_id, FALSE, CAST(:witnesses AS jsonb)
+            if description:  # Only insert if there's a description
+                db.session.execute(
+                    text("""
+                        INSERT INTO memory.turn_history (
+                            turn_id, game_state_id, turn_number,
+                            character_id, sequence_number, action_type,
+                            action_description, location_id, is_private, witnesses,
+                            turn_duration, remaining_duration
+                        ) VALUES (
+                            :turn_id, :game_id, :turn_num,
+                            :char_id, :seq, :action_type,
+                            :description, :loc_id, :is_private, CAST(:witnesses AS jsonb),
+                            :turn_duration, :remaining_duration
+                        )
+                    """),
+                    {
+                        "turn_id": str(uuid4()),
+                        "game_id": str(game_id),
+                        "turn_num": current_turn + 1,
+                        "char_id": str(player_id),
+                        "seq": sequence,
+                        "action_type": action_type,
+                        "description": description,
+                        "loc_id": location_id,
+                        "is_private": is_private,
+                        "witnesses": action_witnesses,
+                        "turn_duration": turn_duration,
+                        "remaining_duration": remaining_duration
+                    }
+                )
+                sequence += 1
+
+                # Process item changes from this action (if any)
+                if not is_private:  # Only process public actions for item manipulations
+                    process_item_changes(
+                        action_description=description,
+                        character_id=player_id,
+                        location_id=location_id,
+                        current_turn=current_turn + 1
                     )
-                """),
-                {
-                    "turn_id": str(uuid4()),
-                    "game_id": str(game_id),
-                    "turn_num": current_turn + 1,
-                    "char_id": str(player_id),
-                    "seq": sequence,
-                    "action": action_text,
-                    "loc_id": location_id,
-                    "witnesses": witnesses_json
-                }
-            )
-            sequence += 1
 
         # Generate and insert atmospheric description
         try:
@@ -621,16 +908,23 @@ def take_action():
 
             # Build combined action description for atmospheric context
             combined_action = ''
-            if dialogue_text:
-                combined_action = f'says "{dialogue_text}"'
-            if action_text:
-                if combined_action:
-                    combined_action += f' and {action_text}'
-                else:
-                    combined_action = action_text
+            for action in actions:
+                action_type = action.get('type', '')
+                description = action.get('description', '')
 
-            # Generate atmospheric description
-            atmos_desc = generate_atmospheric_description(
+                if action_type == 'speak' and description:
+                    if combined_action:
+                        combined_action += f' and says "{description}"'
+                    else:
+                        combined_action = f'says "{description}"'
+                elif action_type != 'think' and description:  # Skip thoughts for atmospheric
+                    if combined_action:
+                        combined_action += f' and {description}'
+                    else:
+                        combined_action = description
+
+            # Generate atmospheric description with mood analysis
+            atmos_result = generate_atmospheric_description(
                 character_name=player_info[0] if player_info else player_name,
                 action_description=combined_action if combined_action else "acts",
                 location_name=location[0] if location else "Unknown",
@@ -641,6 +935,24 @@ def take_action():
                 current_clothing=player_info[2] if player_info else None
             )
 
+            atmos_desc = atmos_result.get('description', '') if isinstance(atmos_result, dict) else atmos_result
+            mood_deltas = atmos_result.get('mood_deltas', {}) if isinstance(atmos_result, dict) else {}
+
+            # Apply item changes from atmospheric description (if any)
+            if isinstance(atmos_result, dict) and atmos_result.get('item_changes'):
+                item_helper = get_item_context_helper()
+                if item_helper:
+                    try:
+                        updated_count = item_helper.apply_item_changes_from_atmospheric_description(
+                            atmos_result,
+                            location_id=location_id,
+                            character_id=player_id
+                        )
+                        if updated_count > 0:
+                            logger.info(f"Applied {updated_count} item changes from atmospheric description")
+                    except Exception as e:
+                        logger.warning(f"Failed to apply item changes: {e}")
+
             # Insert atmospheric description if generated
             if atmos_desc:
                 db.session.execute(
@@ -648,11 +960,13 @@ def take_action():
                         INSERT INTO memory.turn_history (
                             turn_id, game_state_id, turn_number,
                             character_id, sequence_number, action_type,
-                            action_description, location_id, is_private, witnesses
+                            action_description, location_id, is_private, witnesses,
+                            turn_duration, remaining_duration
                         ) VALUES (
                             :turn_id, :game_id, :turn_num,
                             :char_id, :seq, 'atmospheric',
-                            :desc, :loc_id, FALSE, CAST(:witnesses AS jsonb)
+                            :desc, :loc_id, FALSE, CAST(:witnesses AS jsonb),
+                            :turn_duration, :remaining_duration
                         )
                     """),
                     {
@@ -663,7 +977,9 @@ def take_action():
                         "seq": sequence,  # Use the current sequence number
                         "desc": atmos_desc,
                         "loc_id": location_id,
-                        "witnesses": witnesses_json
+                        "witnesses": witnesses_json,
+                        "turn_duration": turn_duration,
+                        "remaining_duration": remaining_duration
                     }
                 )
         except Exception as e:
@@ -680,85 +996,20 @@ def take_action():
             {"game_id": str(game_id)}
         )
 
-        # Commit the turn first to save all actions
+        # Commit the turn to save all actions and character state updates
+        print(f"\n💾 Committing transaction...")
         db.session.commit()
+        print(f"✅ Transaction committed successfully!\n")
 
-        # Update character emotional state based on action's emotional tone
-        if emotional_tone and emotional_tone.strip():
-            try:
-                # Use the emotional_tone directly as the emotional state
-                db.session.execute(
-                    text("""
-                        UPDATE character.character
-                        SET current_emotional_state = :state
-                        WHERE character_id = :char_id
-                    """),
-                    {
-                        "state": emotional_tone,
-                        "char_id": str(player_id)
-                    }
-                )
-                db.session.commit()
-
-                logger.info(f"Updated character emotional state to: {emotional_tone}")
-            except Exception as e:
-                logger.error(f"Error updating character emotional state: {e}")
-                # Continue even if emotional state update fails
-
-        # Update scene mood based on action content (after commit to avoid transaction abort)
+        # Update scene mood based on LLM-analyzed mood deltas (after commit to avoid transaction abort)
         try:
             from models.scene_mood import SceneMood
 
-            # Analyze action content to determine mood impact
-            combined_text = f"{dialogue_text} {action_text}".lower()
-
-            tension_delta = 0
-            romance_delta = 0
-            hostility_delta = 0
-            cooperation_delta = 0
-
-            # Detect escalation keywords
-            escalation_keywords = ['attack', 'strike', 'hit', 'punch', 'kick', 'grab', 'force', 'threaten', 'push', 'shove', 'slam', 'stab', 'cut']
-            if any(keyword in combined_text for keyword in escalation_keywords):
-                tension_delta += 15
-                hostility_delta += 10
-
-            # Detect violence/combat
-            violence_keywords = ['blood', 'wound', 'pain', 'scream', 'cry out', 'hurt']
-            if any(keyword in combined_text for keyword in violence_keywords):
-                tension_delta += 10
-                hostility_delta += 5
-
-            # Detect de-escalation keywords
-            deescalation_keywords = ['calm', 'relax', 'sorry', 'apologize', 'step back', 'back away', 'surrender', 'yield', 'peace']
-            if any(keyword in combined_text for keyword in deescalation_keywords):
-                tension_delta -= 10
-                hostility_delta -= 5
-                cooperation_delta += 5
-
-            # Detect romantic/intimate actions
-            romance_keywords = ['kiss', 'embrace', 'caress', 'touch gently', 'stroke', 'hold close', 'whisper', 'love', 'desire']
-            if any(keyword in combined_text for keyword in romance_keywords):
-                romance_delta += 10
-                tension_delta += 5  # Romantic tension
-
-            # Detect sexual content (builds romantic/sexual tension)
-            sexual_keywords = ['undress', 'clothes off', 'naked', 'bare skin', 'lips on', 'body against', 'desire', 'lust', 'pleasure', 'moan', 'pant', 'thrust', 'penetrate', 'orgasm', 'sex', 'rub', 'nipple', 'breast', 'genital', 'intimate', 'erotic', 'cock', 'pussy']
-            if any(keyword in combined_text for keyword in sexual_keywords):
-                romance_delta += 15
-                tension_delta += 10
-
-            # Detect hostile speech
-            hostile_keywords = ['you bastard', 'you fool', 'idiot', 'hate', 'despise', 'curse', 'damn you', 'fool']
-            if any(keyword in combined_text for keyword in hostile_keywords):
-                hostility_delta += 8
-                tension_delta += 5
-
-            # Detect friendly/cooperative actions
-            friendly_keywords = ['help', 'assist', 'thank', 'appreciate', 'agree', 'smile', 'nod', 'together']
-            if any(keyword in combined_text for keyword in friendly_keywords):
-                cooperation_delta += 5
-                hostility_delta -= 3
+            # Get mood deltas from LLM-generated atmospheric analysis
+            tension_delta = mood_deltas.get('tension', 0) if 'mood_deltas' in locals() else 0
+            romance_delta = mood_deltas.get('romance', 0) if 'mood_deltas' in locals() else 0
+            hostility_delta = mood_deltas.get('hostility', 0) if 'mood_deltas' in locals() else 0
+            cooperation_delta = mood_deltas.get('cooperation', 0) if 'mood_deltas' in locals() else 0
 
             # Apply mood adjustments if any changes detected
             if any([tension_delta, romance_delta, hostility_delta, cooperation_delta]):
@@ -784,7 +1035,7 @@ def take_action():
                     )
                     # create_or_update commits internally, so we're good
 
-                # Now adjust the mood
+                # Now adjust the mood based on LLM analysis
                 SceneMood.adjust(
                     db_session=db.session,
                     game_state_id=game_id,
@@ -794,10 +1045,10 @@ def take_action():
                     hostility_delta=hostility_delta,
                     cooperation_delta=cooperation_delta,
                     current_turn=current_turn + 1,
-                    mood_change_description=f"{player_name}: {action_text}"
+                    mood_change_description=f"{player_name}: {combined_action if combined_action else 'acts'}"
                 )
                 logger.info(
-                    f"Mood adjusted: tension={tension_delta:+d}, romance={romance_delta:+d}, "
+                    f"Mood adjusted (LLM-analyzed): tension={tension_delta:+d}, romance={romance_delta:+d}, "
                     f"hostility={hostility_delta:+d}, cooperation={cooperation_delta:+d}"
                 )
 
@@ -807,17 +1058,27 @@ def take_action():
             traceback.print_exc()
             # Don't fail the turn if mood adjustment fails
 
+        # Build action_data for response (for frontend history display)
+        action_data = {
+            'turn_number': current_turn + 1,
+            'character_name': player_name,
+            'actions': actions,
+            'atmospheric': atmos_desc if 'atmos_desc' in locals() else ''
+        }
+
+        # Add legacy fields for backwards compatibility
+        for action in actions:
+            if action.get('type') == 'think':
+                action_data.setdefault('thought', action.get('description', ''))
+            elif action.get('type') == 'speak':
+                action_data.setdefault('dialogue', action.get('description', ''))
+            elif action.get('type') in ['action', 'interact']:
+                action_data.setdefault('action', action.get('description', ''))
+
         return jsonify({
             'success': True,
             'turn': current_turn + 1,
-            'action_data': {
-                'turn_number': current_turn,
-                'character_name': player_name,
-                'thought': thought_text,
-                'dialogue': dialogue_text,
-                'action': action_text,
-                'atmospheric': atmos_desc if 'atmos_desc' in locals() else ''
-            }
+            'action_data': action_data
         })
 
     except Exception as e:
@@ -878,9 +1139,6 @@ def ai_turn():
             )
             db.session.commit()
             return jsonify({'success': True, 'turn': current_turn + 1, 'message': 'No AI characters present'})
-
-        # Store emotional tones for each character to update after commit
-        char_emotional_tones = {}
 
         for char in ai_chars:
             char_id = char[0]
@@ -962,25 +1220,67 @@ def ai_turn():
             selected_option = ActionSelector.random_select_for_ai(generated_options)
 
             logger.info(f"AI character {char[1]} selected: {selected_option.sequence.summary}")
-            print(f"🤖 AI {char[1]} selected: {selected_option.sequence.summary}")
+            #print(f"🤖 AI {char[1]} selected: {selected_option.sequence.summary}")
+            print(f"🤖 AI {char[1]} selected: {selected_option}")
 
-            # Extract actions from the selected option
-            thought = ''
-            dialogue = ''
-            physical_action = ''
-            emotional_tone = selected_option.sequence.emotional_tone
-
+            # Extract action sequence from the selected option
+            actions = []
             for action in selected_option.sequence.actions:
-                if action.action_type.value == 'think':
-                    thought = action.description
-                elif action.action_type.value == 'speak':
-                    dialogue = action.description
-                else:
-                    physical_action = action.description
+                actions.append({
+                    'type': action.action_type.value,
+                    'description': action.description,
+                    'is_private': action.is_private
+                })
+
+            emotional_tone = selected_option.sequence.emotional_tone
+            current_stance = selected_option.sequence.current_stance
+            current_clothing = selected_option.sequence.current_clothing
+            turn_duration = selected_option.sequence.turn_duration
+
+            # Update character state (emotional state, stance, clothing)
+            print(f"\n🔄 AI CHARACTER STATE UPDATE:")
+            print(f"   Character: {char[1]} (ID: {char_id})")
+            print(f"   Emotional Tone: {emotional_tone}")
+            print(f"   Current Stance: {current_stance}")
+            print(f"   Current Clothing: {current_clothing}")
+            print(f"   Turn Duration: {turn_duration}")
+
+            if emotional_tone or current_stance != 'standing' or current_clothing != 'unchanged':
+                print(f"   ✅ Calling character_update_state()...")
+                result = db.session.execute(
+                    text("SELECT character_update_state(:char_id, :emotional, :stance, :clothing)"),
+                    {
+                        "char_id": str(char_id),
+                        "emotional": emotional_tone if emotional_tone else None,
+                        "stance": current_stance if current_stance != 'unchanged' else None,
+                        "clothing": current_clothing if current_clothing != 'unchanged' else None
+                    }
+                )
+                print(f"   ✅ character_update_state() called, result: {result.fetchone()}")
+
+                # Verify the update
+                verify = db.session.execute(
+                    text("""
+                        SELECT name, current_emotional_state, current_stance, current_clothing
+                        FROM character.character
+                        WHERE character_id = :char_id
+                    """),
+                    {"char_id": str(char_id)}
+                ).fetchone()
+                print(f"   📊 Verification - Character state after update:")
+                print(f"      Name: {verify[0]}")
+                print(f"      Emotional State: {verify[1]}")
+                print(f"      Stance: {verify[2]}")
+                print(f"      Clothing: {verify[3]}")
+            else:
+                print(f"   ⚠️ Skipping update - all values are defaults")
+
+            # Calculate remaining duration (turn_duration - 1 since we're completing first turn)
+            remaining_duration = max(0, turn_duration - 1)
+            print(f"   Remaining Duration: {remaining_duration}\n")
 
             # Continue with existing logic
-            if thought or dialogue or physical_action:
-
+            if actions:
                 # Get witnesses
                 witnesses = db.session.execute(
                     text("""
@@ -997,86 +1297,55 @@ def ai_turn():
                 from uuid import uuid4
                 sequence = 0
 
-                # Record thought if present
-                if thought:
-                    db.session.execute(
-                        text("""
-                            INSERT INTO memory.turn_history (
-                                turn_id, game_state_id, turn_number,
-                                character_id, sequence_number, action_type,
-                                action_description, location_id, is_private, witnesses
-                            ) VALUES (
-                                :turn_id, :game_id, :turn_num,
-                                :char_id, :seq, 'think',
-                                :thought, :loc_id, TRUE, CAST(:witnesses AS jsonb)
-                            )
-                        """),
-                        {
-                            "turn_id": str(uuid4()),
-                            "game_id": str(game_id),
-                            "turn_num": current_turn + 1,
-                            "char_id": str(char_id),
-                            "seq": sequence,
-                            "thought": thought,
-                            "loc_id": location_id,
-                            "witnesses": f'["{char_id}"]'
-                        }
-                    )
-                    sequence += 1
+                # Insert each action in the sequence with proper sequence numbers
+                for action in actions:
+                    action_type = action.get('type', 'action')
+                    description = action.get('description', '')
+                    is_private = action.get('is_private', False)
 
-                # Record dialogue if present
-                if dialogue:
-                    db.session.execute(
-                        text("""
-                            INSERT INTO memory.turn_history (
-                                turn_id, game_state_id, turn_number,
-                                character_id, sequence_number, action_type,
-                                action_description, location_id, is_private, witnesses
-                            ) VALUES (
-                                :turn_id, :game_id, :turn_num,
-                                :char_id, :seq, 'speak',
-                                :dialogue, :loc_id, FALSE, CAST(:witnesses AS jsonb)
-                            )
-                        """),
-                        {
-                            "turn_id": str(uuid4()),
-                            "game_id": str(game_id),
-                            "turn_num": current_turn + 1,
-                            "char_id": str(char_id),
-                            "seq": sequence,
-                            "dialogue": dialogue,
-                            "loc_id": location_id,
-                            "witnesses": witnesses_json
-                        }
-                    )
-                    sequence += 1
+                    # Determine witnesses based on privacy
+                    action_witnesses = f'["{char_id}"]' if is_private else witnesses_json
 
-                # Record physical action
-                if physical_action:
-                    db.session.execute(
-                        text("""
-                            INSERT INTO memory.turn_history (
-                                turn_id, game_state_id, turn_number,
-                                character_id, sequence_number, action_type,
-                                action_description, location_id, is_private, witnesses
-                            ) VALUES (
-                                :turn_id, :game_id, :turn_num,
-                                :char_id, :seq, 'action',
-                                :action, :loc_id, FALSE, CAST(:witnesses AS jsonb)
+                    if description:  # Only insert if there's a description
+                        db.session.execute(
+                            text("""
+                                INSERT INTO memory.turn_history (
+                                    turn_id, game_state_id, turn_number,
+                                    character_id, sequence_number, action_type,
+                                    action_description, location_id, is_private, witnesses,
+                                    turn_duration, remaining_duration
+                                ) VALUES (
+                                    :turn_id, :game_id, :turn_num,
+                                    :char_id, :seq, :action_type,
+                                    :description, :loc_id, :is_private, CAST(:witnesses AS jsonb),
+                                    :turn_duration, :remaining_duration
+                                )
+                            """),
+                            {
+                                "turn_id": str(uuid4()),
+                                "game_id": str(game_id),
+                                "turn_num": current_turn + 1,
+                                "char_id": str(char_id),
+                                "seq": sequence,
+                                "action_type": action_type,
+                                "description": description,
+                                "loc_id": location_id,
+                                "is_private": is_private,
+                                "witnesses": action_witnesses,
+                                "turn_duration": turn_duration,
+                                "remaining_duration": remaining_duration
+                            }
+                        )
+                        sequence += 1
+
+                        # Process item changes from this action (if any)
+                        if not is_private:  # Only process public actions for item manipulations
+                            process_item_changes(
+                                action_description=description,
+                                character_id=char_id,
+                                location_id=location_id,
+                                current_turn=current_turn + 1
                             )
-                        """),
-                        {
-                            "turn_id": str(uuid4()),
-                            "game_id": str(game_id),
-                            "turn_num": current_turn + 1,
-                            "char_id": str(char_id),
-                            "seq": sequence,
-                            "action": physical_action,
-                            "loc_id": location_id,
-                            "witnesses": witnesses_json
-                        }
-                    )
-                    sequence += 1
 
                 # Generate and insert atmospheric description for AI action
                 try:
@@ -1108,16 +1377,23 @@ def ai_turn():
 
                     # Build combined action description for atmospheric context
                     combined_action_ai = ''
-                    if dialogue:
-                        combined_action_ai = f'says "{dialogue}"'
-                    if physical_action:
-                        if combined_action_ai:
-                            combined_action_ai += f' and {physical_action}'
-                        else:
-                            combined_action_ai = physical_action
+                    for action in actions:
+                        action_type = action.get('type', '')
+                        description = action.get('description', '')
 
-                    # Generate atmospheric description
-                    atmos_desc_ai = generate_atmospheric_description(
+                        if action_type == 'speak' and description:
+                            if combined_action_ai:
+                                combined_action_ai += f' and says "{description}"'
+                            else:
+                                combined_action_ai = f'says "{description}"'
+                        elif action_type != 'think' and description:  # Skip thoughts for atmospheric
+                            if combined_action_ai:
+                                combined_action_ai += f' and {description}'
+                            else:
+                                combined_action_ai = description
+
+                    # Generate atmospheric description with mood analysis
+                    atmos_result_ai = generate_atmospheric_description(
                         character_name=char[1],
                         action_description=combined_action_ai if combined_action_ai else "acts",
                         location_name=location[0] if location else "Unknown",
@@ -1128,6 +1404,24 @@ def ai_turn():
                         current_clothing=char[7] if len(char) > 7 else None
                     )
 
+                    atmos_desc_ai = atmos_result_ai.get('description', '') if isinstance(atmos_result_ai, dict) else atmos_result_ai
+                    mood_deltas_ai = atmos_result_ai.get('mood_deltas', {}) if isinstance(atmos_result_ai, dict) else {}
+
+                    # Apply item changes from atmospheric description (if any)
+                    if isinstance(atmos_result_ai, dict) and atmos_result_ai.get('item_changes'):
+                        item_helper = get_item_context_helper()
+                        if item_helper:
+                            try:
+                                updated_count = item_helper.apply_item_changes_from_atmospheric_description(
+                                    atmos_result_ai,
+                                    location_id=location_id,
+                                    character_id=char_id
+                                )
+                                if updated_count > 0:
+                                    logger.info(f"Applied {updated_count} item changes from AI atmospheric description")
+                            except Exception as e:
+                                logger.warning(f"Failed to apply AI item changes: {e}")
+
                     # Insert atmospheric description if generated
                     if atmos_desc_ai:
                         db.session.execute(
@@ -1135,11 +1429,13 @@ def ai_turn():
                                 INSERT INTO memory.turn_history (
                                     turn_id, game_state_id, turn_number,
                                     character_id, sequence_number, action_type,
-                                    action_description, location_id, is_private, witnesses
+                                    action_description, location_id, is_private, witnesses,
+                                    turn_duration, remaining_duration
                                 ) VALUES (
                                     :turn_id, :game_id, :turn_num,
                                     :char_id, :seq, 'atmospheric',
-                                    :desc, :loc_id, FALSE, CAST(:witnesses AS jsonb)
+                                    :desc, :loc_id, FALSE, CAST(:witnesses AS jsonb),
+                                    :turn_duration, :remaining_duration
                                 )
                             """),
                             {
@@ -1150,16 +1446,14 @@ def ai_turn():
                                 "seq": sequence,  # Use the current sequence number
                                 "desc": atmos_desc_ai,
                                 "loc_id": location_id,
-                                "witnesses": witnesses_json
+                                "witnesses": witnesses_json,
+                                "turn_duration": turn_duration,
+                                "remaining_duration": remaining_duration
                             }
                         )
                 except Exception as e:
                     logger.error(f"Error generating AI atmospheric description: {e}")
                     # Continue even if atmospheric description fails
-
-                # Store emotional tone for this character to update after commit
-                if emotional_tone:
-                    char_emotional_tones[char_id] = (emotional_tone, char[1])  # Store tone and name
 
         # Increment turn
         new_turn = current_turn + 1
@@ -1172,32 +1466,66 @@ def ai_turn():
             {"game_id": str(game_id)}
         )
 
+        print(f"\n💾 Committing AI turn transaction...")
         db.session.commit()
+        print(f"✅ AI turn transaction committed successfully!\n")
 
-        # Update AI character emotional states based on action emotional tones
-        # (Do this after commit to avoid transaction issues)
-        if char_emotional_tones:
-            for char_id, (emotional_tone, char_name) in char_emotional_tones.items():
-                if emotional_tone and emotional_tone.strip():
-                    try:
-                        # Use the emotional_tone directly as the emotional state
-                        db.session.execute(
-                            text("""
-                                UPDATE character.character
-                                SET current_emotional_state = :state
-                                WHERE character_id = :char_id
-                            """),
-                            {
-                                "state": emotional_tone,
-                                "char_id": str(char_id)
-                            }
+        # Update scene mood based on LLM-analyzed mood deltas (after commit to avoid transaction abort)
+        try:
+            from models.scene_mood import SceneMood
+
+            # Get mood deltas from LLM-generated atmospheric analysis
+            if 'mood_deltas_ai' in locals():
+                tension_delta = mood_deltas_ai.get('tension', 0)
+                romance_delta = mood_deltas_ai.get('romance', 0)
+                hostility_delta = mood_deltas_ai.get('hostility', 0)
+                cooperation_delta = mood_deltas_ai.get('cooperation', 0)
+
+                # Apply mood adjustments if any changes detected
+                if any([tension_delta, romance_delta, hostility_delta, cooperation_delta]):
+                    # Check if mood exists, create if not
+                    existing_mood = SceneMood.get(
+                        db_session=db.session,
+                        game_state_id=game_id,
+                        location_id=player_location_id
+                    )
+
+                    if not existing_mood:
+                        # Initialize mood for this location
+                        logger.info(f"Initializing mood for location {player_location_id}")
+                        SceneMood.create_or_update(
+                            db_session=db.session,
+                            game_state_id=game_id,
+                            location_id=player_location_id,
+                            tension_level=0,
+                            romance_level=0,
+                            hostility_level=0,
+                            cooperation_level=0,
+                            last_mood_change_turn=new_turn
                         )
-                        db.session.commit()
 
-                        logger.info(f"Updated AI character {char_name} emotional state to: {emotional_tone}")
-                    except Exception as e:
-                        logger.error(f"Error updating AI character emotional state: {e}")
-                        # Continue even if emotional state update fails
+                    # Now adjust the mood based on LLM analysis
+                    SceneMood.adjust(
+                        db_session=db.session,
+                        game_state_id=game_id,
+                        location_id=player_location_id,
+                        tension_delta=tension_delta,
+                        romance_delta=romance_delta,
+                        hostility_delta=hostility_delta,
+                        cooperation_delta=cooperation_delta,
+                        current_turn=new_turn,
+                        mood_change_description=f"AI character action"
+                    )
+                    logger.info(
+                        f"AI Mood adjusted (LLM-analyzed): tension={tension_delta:+d}, romance={romance_delta:+d}, "
+                        f"hostility={hostility_delta:+d}, cooperation={cooperation_delta:+d}"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error adjusting AI mood: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't fail the turn if mood adjustment fails
 
         # Create memory summary every 10 turns
         if new_turn % 10 == 0:

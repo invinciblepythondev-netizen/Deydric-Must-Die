@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS memory.turn_history (
     is_embedded BOOLEAN DEFAULT false, -- Has this been embedded in vector DB?
     embedding_id TEXT, -- ID in vector database
 
+    -- Turn duration tracking
+    turn_duration INTEGER DEFAULT 1 CHECK (turn_duration >= 1), -- Total turns this action takes (1 turn = ~30 seconds)
+    remaining_duration INTEGER DEFAULT 0 CHECK (remaining_duration >= 0), -- Turns remaining for action completion
+
     -- Metadata
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -46,6 +50,8 @@ COMMENT ON COLUMN memory.turn_history.action_type IS 'Action type: think, speak,
 COMMENT ON COLUMN memory.turn_history.witnesses IS 'Array of character_ids who were in the same location (empty for private actions)';
 COMMENT ON COLUMN memory.turn_history.significance_score IS 'How important this event is (0-1) for LLM context';
 COMMENT ON COLUMN memory.turn_history.is_embedded IS 'Whether this turn has been embedded in the vector database';
+COMMENT ON COLUMN memory.turn_history.turn_duration IS 'Total number of turns this action takes (1 turn = ~30 seconds)';
+COMMENT ON COLUMN memory.turn_history.remaining_duration IS 'Number of turns remaining for this action to complete (0 = action complete this turn)';
 
 -- Memory summaries table
 CREATE TABLE IF NOT EXISTS memory.memory_summary (
@@ -96,5 +102,6 @@ CREATE INDEX IF NOT EXISTS idx_turn_history_character ON memory.turn_history(cha
 CREATE INDEX IF NOT EXISTS idx_turn_history_location ON memory.turn_history(location_id);
 CREATE INDEX IF NOT EXISTS idx_turn_history_significance ON memory.turn_history(significance_score DESC) WHERE significance_score > 0.7;
 CREATE INDEX IF NOT EXISTS idx_turn_history_not_embedded ON memory.turn_history(is_embedded) WHERE is_embedded = false;
+CREATE INDEX IF NOT EXISTS idx_turn_history_ongoing_actions ON memory.turn_history(character_id, remaining_duration) WHERE remaining_duration > 0;
 CREATE INDEX IF NOT EXISTS idx_memory_summary_game ON memory.memory_summary(game_state_id, start_turn, end_turn);
 CREATE INDEX IF NOT EXISTS idx_character_thought_character ON memory.character_thought(character_id, turn_number);

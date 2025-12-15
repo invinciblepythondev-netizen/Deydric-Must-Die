@@ -12,6 +12,8 @@ RETURNS TABLE (
     backstory TEXT,
     physical_appearance TEXT,
     current_clothing TEXT,
+    appearance_state_detailed TEXT,
+    appearance_state_summary TEXT,
     role_responsibilities TEXT,
     intro_summary TEXT,
     personality_traits JSONB,
@@ -41,12 +43,13 @@ BEGIN
     RETURN QUERY
     SELECT
         c.character_id, c.name, c.short_name, c.is_player, c.gender, c.age,
-        c.backstory, c.physical_appearance, c.current_clothing, c.role_responsibilities,
-        c.intro_summary, c.personality_traits, c.speech_style, c.education_level,
-        c.current_emotional_state, c.motivations_short_term, c.motivations_long_term,
-        c.preferences, c.skills, c.superstitions, c.hobbies, c.social_class,
-        c.reputation, c.secrets, c.fears, c.inner_conflict, c.core_values,
-        c.current_stance, c.current_location_id, c.fatigue, c.hunger,
+        c.backstory, c.physical_appearance, c.current_clothing,
+        c.appearance_state_detailed, c.appearance_state_summary,
+        c.role_responsibilities, c.intro_summary, c.personality_traits, c.speech_style,
+        c.education_level, c.current_emotional_state, c.motivations_short_term,
+        c.motivations_long_term, c.preferences, c.skills, c.superstitions, c.hobbies,
+        c.social_class, c.reputation, c.secrets, c.fears, c.inner_conflict,
+        c.core_values, c.current_stance, c.current_location_id, c.fatigue, c.hunger,
         c.created_at, c.updated_at
     FROM character.character c
     WHERE c.character_id = p_character_id;
@@ -61,6 +64,8 @@ RETURNS TABLE (
     is_player BOOLEAN,
     physical_appearance TEXT,
     current_clothing TEXT,
+    appearance_state_detailed TEXT,
+    appearance_state_summary TEXT,
     current_stance TEXT,
     current_emotional_state TEXT,
     fatigue INTEGER,
@@ -70,7 +75,8 @@ BEGIN
     RETURN QUERY
     SELECT
         c.character_id, c.name, c.is_player, c.physical_appearance,
-        c.current_clothing, c.current_stance, c.current_emotional_state,
+        c.current_clothing, c.appearance_state_detailed, c.appearance_state_summary,
+        c.current_stance, c.current_emotional_state,
         c.fatigue, c.hunger
     FROM character.character c
     WHERE c.current_location_id = p_location_id;
@@ -88,6 +94,8 @@ CREATE OR REPLACE FUNCTION character_upsert(
     p_backstory TEXT DEFAULT NULL,
     p_physical_appearance TEXT DEFAULT NULL,
     p_current_clothing TEXT DEFAULT NULL,
+    p_appearance_state_detailed TEXT DEFAULT NULL,
+    p_appearance_state_summary TEXT DEFAULT NULL,
     p_role_responsibilities TEXT DEFAULT NULL,
     p_intro_summary TEXT DEFAULT NULL,
     p_personality_traits JSONB DEFAULT '[]'::jsonb,
@@ -120,20 +128,22 @@ BEGIN
 
     INSERT INTO character.character (
         character_id, name, short_name, is_player, gender, age,
-        backstory, physical_appearance, current_clothing, role_responsibilities,
-        intro_summary, personality_traits, speech_style, education_level,
-        current_emotional_state, motivations_short_term, motivations_long_term,
-        preferences, skills, superstitions, hobbies, social_class,
-        reputation, secrets, fears, inner_conflict, core_values,
+        backstory, physical_appearance, current_clothing,
+        appearance_state_detailed, appearance_state_summary,
+        role_responsibilities, intro_summary, personality_traits, speech_style,
+        education_level, current_emotional_state, motivations_short_term,
+        motivations_long_term, preferences, skills, superstitions, hobbies,
+        social_class, reputation, secrets, fears, inner_conflict, core_values,
         current_stance, current_location_id, fatigue, hunger
     ) VALUES (
         v_character_id, p_name, p_short_name, p_is_player, p_gender, p_age,
-        p_backstory, p_physical_appearance, p_current_clothing, p_role_responsibilities,
-        p_intro_summary, p_personality_traits, p_speech_style, p_education_level,
-        p_current_emotional_state, p_motivations_short_term, p_motivations_long_term,
-        p_preferences, p_skills, p_superstitions, p_hobbies, p_social_class,
-        p_reputation, p_secrets, p_fears, p_inner_conflict, p_core_values,
-        p_current_stance, p_current_location_id, p_fatigue, p_hunger
+        p_backstory, p_physical_appearance, p_current_clothing,
+        p_appearance_state_detailed, p_appearance_state_summary,
+        p_role_responsibilities, p_intro_summary, p_personality_traits, p_speech_style,
+        p_education_level, p_current_emotional_state, p_motivations_short_term,
+        p_motivations_long_term, p_preferences, p_skills, p_superstitions, p_hobbies,
+        p_social_class, p_reputation, p_secrets, p_fears, p_inner_conflict,
+        p_core_values, p_current_stance, p_current_location_id, p_fatigue, p_hunger
     )
     ON CONFLICT (character_id) DO UPDATE SET
         name = EXCLUDED.name,
@@ -144,6 +154,8 @@ BEGIN
         backstory = EXCLUDED.backstory,
         physical_appearance = EXCLUDED.physical_appearance,
         current_clothing = EXCLUDED.current_clothing,
+        appearance_state_detailed = EXCLUDED.appearance_state_detailed,
+        appearance_state_summary = EXCLUDED.appearance_state_summary,
         role_responsibilities = EXCLUDED.role_responsibilities,
         intro_summary = EXCLUDED.intro_summary,
         personality_traits = EXCLUDED.personality_traits,
@@ -183,6 +195,34 @@ BEGIN
     SET current_location_id = p_location_id,
         updated_at = CURRENT_TIMESTAMP
     WHERE character_id = p_character_id;
+
+    RETURN FOUND;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Update character state (emotional state, stance, clothing)
+CREATE OR REPLACE FUNCTION character_update_state(
+    p_character_id UUID,
+    p_emotional_state TEXT DEFAULT NULL,
+    p_stance TEXT DEFAULT NULL,
+    p_clothing TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RAISE NOTICE '🔧 character_update_state called:';
+    RAISE NOTICE '   Character ID: %', p_character_id;
+    RAISE NOTICE '   Emotional State: %', p_emotional_state;
+    RAISE NOTICE '   Stance: %', p_stance;
+    RAISE NOTICE '   Clothing: %', p_clothing;
+
+    UPDATE character.character
+    SET current_emotional_state = COALESCE(p_emotional_state, current_emotional_state),
+        current_stance = COALESCE(p_stance, current_stance),
+        current_clothing = COALESCE(p_clothing, current_clothing),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE character_id = p_character_id;
+
+    RAISE NOTICE '   ✅ Updated % row(s)', FOUND;
 
     RETURN FOUND;
 END;

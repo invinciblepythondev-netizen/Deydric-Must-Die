@@ -38,9 +38,10 @@ class TogetherAIProvider(LLMProvider):
     """
 
     # Available models on Together.ai
+    # NOTE: Use Instruct-Turbo variants instead of chat-hf (chat-hf has safety training)
     AVAILABLE_MODELS = {
         "mixtral-8x7b": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        "llama-3-70b": "meta-llama/Llama-3-70b-chat-hf",
+        "llama-3.1-70b": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",  # More permissive than chat-hf
         "llama-3.1-405b": "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo"
     }
 

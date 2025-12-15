@@ -101,6 +101,9 @@ class ActionSequence:
     emotional_tone: str  # e.g., "cunning", "aggressive", "friendly"
     estimated_mood_impact: Dict[str, int] = field(default_factory=dict)  # {tension: +10, hostility: +5}
     turn_duration: int = 1  # Number of turns this action takes (1 turn = ~30 seconds)
+    current_stance: str = "standing"  # Character's physical position after action
+    current_clothing: str = "unchanged"  # Description of clothing changes or "unchanged"
+    current_emotional_state: str = "neutral"  # Character's internal emotional state after action
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -111,7 +114,10 @@ class ActionSequence:
             'deescalates_mood': self.deescalates_mood,
             'emotional_tone': self.emotional_tone,
             'estimated_mood_impact': self.estimated_mood_impact,
-            'turn_duration': self.turn_duration
+            'turn_duration': self.turn_duration,
+            'current_stance': self.current_stance,
+            'current_clothing': self.current_clothing,
+            'current_emotional_state': self.current_emotional_state
         }
 
     @classmethod
@@ -124,7 +130,10 @@ class ActionSequence:
             deescalates_mood=data['deescalates_mood'],
             emotional_tone=data['emotional_tone'],
             estimated_mood_impact=data.get('estimated_mood_impact', {}),
-            turn_duration=data.get('turn_duration', 1)
+            turn_duration=data.get('turn_duration', 1),
+            current_stance=data.get('current_stance', 'standing'),
+            current_clothing=data.get('current_clothing', 'unchanged'),
+            current_emotional_state=data.get('current_emotional_state', 'neutral')
         )
 
     def get_public_description(self) -> str:
@@ -253,7 +262,9 @@ def create_simple_sequence(
     escalates: bool = False,
     deescalates: bool = False,
     emotional_tone: str = "neutral",
-    turn_duration: int = 1
+    turn_duration: int = 1,
+    current_stance: str = "standing",
+    current_clothing: str = "unchanged"
 ) -> ActionSequence:
     """Helper to create a simple action sequence."""
     return ActionSequence(
@@ -262,5 +273,7 @@ def create_simple_sequence(
         escalates_mood=escalates,
         deescalates_mood=deescalates,
         emotional_tone=emotional_tone,
-        turn_duration=turn_duration
+        turn_duration=turn_duration,
+        current_stance=current_stance,
+        current_clothing=current_clothing
     )

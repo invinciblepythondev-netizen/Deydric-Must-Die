@@ -198,6 +198,8 @@ class Turn:
                 'action_description': row.action_description,
                 'is_private': row.is_private,
                 'outcome_description': row.outcome_description,
+                'turn_duration': row.turn_duration,
+                'remaining_duration': row.remaining_duration,
                 'created_at': row.created_at
             })
 

@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS character.character (
     backstory TEXT,
     physical_appearance TEXT,
     current_clothing TEXT,
+    appearance_state_detailed TEXT, -- Dynamic appearance changes (clothing condition, positioning, dishevelment, etc.)
+    appearance_state_summary TEXT, -- Brief version for small context models
     role_responsibilities TEXT,
     intro_summary TEXT,
 

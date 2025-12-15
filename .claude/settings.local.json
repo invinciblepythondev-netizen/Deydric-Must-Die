@@ -13,7 +13,9 @@
       "Bash(findstr:*)",
       "Bash(.\\venv\\Scripts\\python.exe:*)",
       "Bash(python scripts/test_providers.py:*)",
-      "Bash(nul)"
+      "Bash(nul)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python scripts/apply_memory_summary_migration.py:*)"
     ],
     "deny": [],
     "ask": []

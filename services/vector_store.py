@@ -195,18 +195,20 @@ class VectorStoreService:
             # Generate query embedding
             query_embedding = self._get_embedding(query)
 
-            # Search Qdrant
-            results = self.client.search(
+            # Search Qdrant using query_points (new Qdrant API)
+            response = self.client.query_points(
                 collection_name=self.collection_name,
-                query_vector=query_embedding,
+                query=query_embedding,
                 limit=limit,
                 score_threshold=score_threshold,
-                query_filter=filter_conditions
+                query_filter=filter_conditions,
+                with_payload=True,
+                with_vectors=False
             )
 
             # Format results
             memories = []
-            for result in results:
+            for result in response.points:
                 memories.append({
                     'id': result.id,
                     'score': result.score,
@@ -344,6 +346,236 @@ class VectorStoreService:
             print(f"[ERROR] Failed to delete memory {memory_id}: {e}")
             return False
 
+    def add_summary(
+        self,
+        summary_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        use_descriptive: bool = True
+    ) -> bool:
+        """
+        Add a memory summary to the vector store.
+
+        Args:
+            summary_id: Unique ID for this summary (UUID from database)
+            text: The summary text to embed (descriptive or condensed version)
+            metadata: Additional data (character_id, window_type, start_turn, end_turn, etc.)
+            use_descriptive: Whether this is the descriptive (True) or condensed (False) version
+
+        Returns:
+            True if successful
+        """
+        try:
+            # Add metadata to indicate this is a summary
+            metadata_with_type = {
+                **metadata,
+                'memory_type': 'summary',
+                'summary_version': 'descriptive' if use_descriptive else 'condensed'
+            }
+
+            # Generate embedding
+            embedding = self._get_embedding(text)
+
+            # Create point
+            point = PointStruct(
+                id=summary_id,
+                vector=embedding,
+                payload=metadata_with_type
+            )
+
+            # Upsert to Qdrant
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=[point]
+            )
+
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to add summary {summary_id}: {e}")
+            return False
+
+    def add_summaries_batch(
+        self,
+        summaries: List[Dict[str, Any]],
+        use_descriptive: bool = True
+    ) -> int:
+        """
+        Add multiple memory summaries in a batch.
+
+        Args:
+            summaries: List of dicts with keys: id, text, metadata
+            use_descriptive: Whether to embed descriptive (True) or condensed (False) version
+
+        Returns:
+            Number of summaries successfully added
+        """
+        points = []
+
+        for summary in summaries:
+            try:
+                # Get the appropriate text version
+                text = summary.get('text', '')
+                metadata = summary.get('metadata', {})
+
+                # Add summary metadata
+                metadata_with_type = {
+                    **metadata,
+                    'memory_type': 'summary',
+                    'summary_version': 'descriptive' if use_descriptive else 'condensed'
+                }
+
+                embedding = self._get_embedding(text)
+                point = PointStruct(
+                    id=summary['id'],
+                    vector=embedding,
+                    payload=metadata_with_type
+                )
+                points.append(point)
+            except Exception as e:
+                print(f"[WARN] Failed to process summary {summary.get('id')}: {e}")
+
+        if points:
+            try:
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=points
+                )
+                return len(points)
+            except Exception as e:
+                print(f"[ERROR] Batch upsert failed: {e}")
+                return 0
+
+        return 0
+
+    def search_summaries(
+        self,
+        query: str,
+        limit: int = 5,
+        score_threshold: float = 0.7,
+        filter_conditions: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for relevant memory summaries using semantic similarity.
+
+        Args:
+            query: The search query text
+            limit: Maximum number of results to return
+            score_threshold: Minimum similarity score (0-1)
+            filter_conditions: Optional Qdrant filter dict
+
+        Returns:
+            List of dicts with keys: id, score, metadata
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        # Add filter for memory_type = 'summary'
+        summary_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="memory_type",
+                    match=MatchValue(value="summary")
+                )
+            ]
+        )
+
+        # Combine with additional filters if provided
+        if filter_conditions:
+            if hasattr(filter_conditions, 'must'):
+                summary_filter.must.extend(filter_conditions.must)
+            if hasattr(filter_conditions, 'should'):
+                summary_filter.should = filter_conditions.should
+            if hasattr(filter_conditions, 'must_not'):
+                summary_filter.must_not = filter_conditions.must_not
+
+        return self.search_memories(
+            query=query,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_conditions=summary_filter
+        )
+
+    def search_summaries_by_character(
+        self,
+        query: str,
+        character_id: str,
+        limit: int = 5,
+        score_threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """
+        Search memory summaries for a specific character.
+
+        Args:
+            query: The search query text
+            character_id: UUID of the character
+            limit: Maximum number of results
+            score_threshold: Minimum similarity score
+
+        Returns:
+            List of relevant summaries
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        filter_conditions = Filter(
+            must=[
+                FieldCondition(
+                    key="memory_type",
+                    match=MatchValue(value="summary")
+                ),
+                FieldCondition(
+                    key="character_id",
+                    match=MatchValue(value=character_id)
+                )
+            ]
+        )
+
+        return self.search_memories(
+            query=query,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_conditions=filter_conditions
+        )
+
+    def search_summaries_by_window(
+        self,
+        query: str,
+        window_type: str,
+        limit: int = 5,
+        score_threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """
+        Search summaries of a specific time window type.
+
+        Args:
+            query: The search query text
+            window_type: Type of window (recent_10, rolling_50, deep_720, etc.)
+            limit: Maximum number of results
+            score_threshold: Minimum similarity score
+
+        Returns:
+            List of relevant summaries
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        filter_conditions = Filter(
+            must=[
+                FieldCondition(
+                    key="memory_type",
+                    match=MatchValue(value="summary")
+                ),
+                FieldCondition(
+                    key="window_type",
+                    match=MatchValue(value=window_type)
+                )
+            ]
+        )
+
+        return self.search_memories(
+            query=query,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_conditions=filter_conditions
+        )
+
     def count_memories(self) -> int:
         """
         Get the total number of memories in the collection.
@@ -356,6 +588,32 @@ class VectorStoreService:
             return collection_info.points_count
         except Exception as e:
             print(f"[ERROR] Failed to count memories: {e}")
+            return 0
+
+    def count_summaries(self) -> int:
+        """
+        Get the total number of memory summaries in the collection.
+
+        Returns:
+            Count of summaries
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        try:
+            result = self.client.count(
+                collection_name=self.collection_name,
+                count_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="memory_type",
+                            match=MatchValue(value="summary")
+                        )
+                    ]
+                )
+            )
+            return result.count
+        except Exception as e:
+            print(f"[ERROR] Failed to count summaries: {e}")
             return 0
 
     def clear_collection(self) -> bool:

@@ -23,6 +23,8 @@ from models.scene_mood import SceneMood
 from models.game_time import GameTime
 from models.turn import Turn
 from services.context_manager import build_character_context, ContextPriority, _get_adaptive_memory_window
+from services.item_store import ItemStore
+from services.item_context_helper import ItemContextHelper
 from sqlalchemy import text
 
 # Import for proper error handling of provider fallback
@@ -34,6 +36,70 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+
+def _format_combined_turn_history(actions: List[Dict[str, Any]]) -> List[str]:
+    """
+    Format turn history by combining all actions for each character per turn.
+
+    Example output:
+    Turn 3: Sir Gelarthon Findraell - Speak "I dream of the way you move",
+    Speak: "Fizrae, my love...", Interact: "Sir Gelarthon reaches for Fizrae" (2T, 1 remaining)
+
+    Args:
+        actions: List of action dictionaries with turn_number, sequence_number,
+                character_name, action_type, action_description, turn_duration, etc.
+
+    Returns:
+        List of formatted turn strings
+    """
+    from collections import defaultdict
+
+    # Group actions by (turn_number, character_name)
+    turns_grouped = defaultdict(list)
+    for action in actions:
+        key = (action['turn_number'], action['character_name'])
+        turns_grouped[key].append(action)
+
+    # Sort each group by sequence_number to maintain order
+    for key in turns_grouped:
+        turns_grouped[key].sort(key=lambda a: a.get('sequence_number', 0))
+
+    # Format each turn
+    formatted_lines = []
+    for (turn_num, char_name), turn_actions in sorted(turns_grouped.items()):
+        # Combine all action descriptions for this character's turn
+        action_parts = []
+        for action in turn_actions:
+            action_type = action['action_type'].capitalize()
+            description = action['action_description']
+
+            # Format based on action type
+            if action_type.lower() in ['speak', 'think']:
+                # For speech/thoughts, show type and quoted text
+                action_parts.append(f'{action_type} "{description}"')
+            else:
+                # For other actions, show type: description
+                action_parts.append(f'{action_type}: "{description}"')
+
+        # Build the line: Turn X: Character Name - action1, action2, action3
+        combined_actions = ', '.join(action_parts)
+        line = f"Turn {turn_num}: {char_name} - {combined_actions}"
+
+        # Add turn duration info if applicable (use info from last action in sequence)
+        last_action = turn_actions[-1]
+        turn_duration = last_action.get('turn_duration', 1)
+        remaining_duration = last_action.get('remaining_duration', 0)
+
+        if turn_duration > 1 or remaining_duration > 0:
+            line += f" ({turn_duration}T"
+            if remaining_duration > 0:
+                line += f", {remaining_duration} remaining"
+            line += ")"
+
+        formatted_lines.append(line)
+
+    return formatted_lines
 
 
 class ActionGenerationContext:
@@ -62,158 +128,14 @@ class ActionGenerationContext:
         self.current_turn = current_turn
         self.llm_provider = llm_provider
 
-    def _analyze_mood_from_actions(self, recent_actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Analyze the mood/atmosphere dynamically from recent actions using LLM.
-        Retries up to 2 times on invalid JSON responses.
-
-        Args:
-            recent_actions: List of recent action dictionaries
-
-        Returns:
-            Dictionary with mood_description and mood_guidance
-        """
-        if not recent_actions or not self.llm_provider:
-            # Fallback to neutral mood
-            return {
-                'mood_description': "General mood: Neutral. The atmosphere is calm.",
-                'mood_guidance': {
-                    'should_generate_escalation': False,
-                    'escalation_weight': 0.5,
-                    'deescalation_required': False,
-                    'mood_category': 'neutral'
-                }
-            }
-
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            try:
-                if attempt > 0:
-                    logger.info(f"Retrying mood analysis (attempt {attempt + 1}/{max_retries + 1})...")
-                    print(f"🔄 Retrying mood analysis (attempt {attempt + 1}/{max_retries + 1})...")
-                # Format recent actions for the LLM
-                action_lines = []
-                for action in recent_actions[-10:]:  # Last 10 actions max
-                    action_lines.append(
-                        f"Turn {action['turn_number']}: {action['character_name']} - {action['action_description']}"
-                    )
-
-                actions_text = "\n".join(action_lines)
-
-                # Build prompt for mood analysis
-                system_prompt = """You are an expert at analyzing emotional atmosphere and interpersonal dynamics in narrative scenes.
-
-Analyze the recent actions and determine the current mood/atmosphere. Consider:
-- Tension level (calm → tense → volatile)
-- Romance level (neutral → flirtatious → passionate → intimate)
-- Hostility level (friendly → irritated → hostile → violent)
-- Overall emotional intensity
-
-Return a JSON object with:
-{
-  "mood_description": "1-2 sentence description of the current atmosphere",
-  "tension_level": "calm|moderate|high|volatile",
-  "romance_level": "none|subtle|moderate|high|passionate",
-  "hostility_level": "none|subtle|moderate|high",
-  "should_escalate": true/false,
-  "escalation_weight": 0.0-1.0,
-  "mood_category": "neutral|tense|romantic|hostile|conflicted"
-}"""
-
-                user_prompt = f"""Analyze the mood from these recent actions:
-
-{actions_text}
-
-Current location: {self.location.get('name')}
-Characters present: {', '.join([c.get('name') for c in self.visible_characters])}
-
-What is the current emotional atmosphere?"""
-
-                # Call LLM with automatic fallback
-                response = self.llm_provider.generate(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    temperature=0.3,  # Lower temperature for consistent analysis
-                    max_tokens=300
-                )
-                print("🎭 Mood analysis LLM response received (with resilient fallback)")
-
-                # Parse response
-                import re
-                json_str = response
-                if "```json" in response:
-                    json_str = response.split("```json")[1].split("```")[0].strip()
-                elif "```" in response:
-                    json_str = response.split("```")[1].split("```")[0].strip()
-
-                # Clean up JSON
-                json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
-
-                mood_data = json.loads(json_str)
-
-                # Build mood description
-                mood_description = mood_data.get('mood_description', 'The atmosphere is neutral.')
-
-                # Convert to action guidance format
-                should_escalate = mood_data.get('should_escalate', False)
-                escalation_weight = float(mood_data.get('escalation_weight', 0.5))
-
-                mood_guidance = {
-                    'should_generate_escalation': should_escalate,
-                    'escalation_weight': escalation_weight,
-                    'deescalation_required': True,  # Always provide at least one de-escalation option
-                    'mood_category': mood_data.get('mood_category', 'neutral')
-                }
-
-                logger.info(f"Dynamic mood analysis: {mood_data.get('mood_category')} (escalation_weight={escalation_weight:.2f})")
-
-                # Success! Return result
-                return {
-                    'mood_description': mood_description,
-                    'mood_guidance': mood_guidance
-                }
-
-            except json.JSONDecodeError as e:
-                logger.warning(f"JSON decode error in mood analysis (attempt {attempt + 1}/{max_retries + 1}): {e}")
-                print(f"⚠️  JSON decode error in mood analysis: {str(e)[:100]}")
-                if attempt < max_retries:
-                    continue  # Retry
-                else:
-                    # Final attempt failed, fall through to fallback
-                    raise
-
-            except AllProvidersFailedError as e:
-                logger.error(
-                    f"All providers failed for mood analysis: {e}",
-                    exc_info=True
-                )
-                print(f"⚠️  All providers failed for mood analysis. Using neutral mood.")
-                # Don't retry on provider failures - fallback immediately
-                break
-
-            except Exception as e:
-                logger.error(
-                    f"Error analyzing mood from actions (attempt {attempt + 1}/{max_retries + 1}): {e}",
-                    exc_info=True
-                )
-                print(f"⚠️  Error in mood analysis: {str(e)[:100]}")
-                if attempt < max_retries:
-                    continue  # Retry
-                else:
-                    # Final attempt failed, fall through to fallback
-                    break
-
-        # All retries exhausted or provider failed - fallback to neutral mood
-        logger.warning("Using neutral mood fallback after retries exhausted")
-        return {
-            'mood_description': "General mood: Neutral. The atmosphere is calm.",
-            'mood_guidance': {
-                'should_generate_escalation': False,
-                'escalation_weight': 0.5,
-                'deescalation_required': False,
-                'mood_category': 'neutral'
-            }
-        }
+        # Initialize item system
+        try:
+            self.item_store = ItemStore()
+            self.item_context_helper = ItemContextHelper(self.item_store)
+        except Exception as e:
+            logger.warning(f"Failed to initialize item system: {e}")
+            self.item_store = None
+            self.item_context_helper = None
 
     def build(self, model: str) -> Dict[str, Any]:
         """
@@ -236,15 +158,41 @@ What is the current emotional atmosphere?"""
         context['character_name'] = self.character.get('name')
         context['character_emotional_state'] = self.character.get('current_emotional_state')
         context['character_motivations'] = self.character.get('motivations_short_term')
+        context['character_stance'] = self.character.get('current_stance', 'standing')
+
+        # Get clothing from Qdrant items (dynamic)
+        if self.item_context_helper:
+            try:
+                character_id = self.character.get('character_id')
+                clothing_from_items = self.item_context_helper.get_clothing_description_from_items(
+                    character_id, brief=True
+                )
+                context['character_clothing'] = clothing_from_items or self.character.get('current_clothing', 'unchanged')
+            except Exception as e:
+                logger.warning(f"Failed to get clothing from items: {e}")
+                context['character_clothing'] = self.character.get('current_clothing', 'unchanged')
+        else:
+            context['character_clothing'] = self.character.get('current_clothing', 'unchanged')
 
         # Visible characters (basic attributes only)
         context['visible_characters'] = []
         for char in self.visible_characters:
+            # Get clothing for visible characters from Qdrant too
+            char_clothing = char.get('current_clothing')
+            if self.item_context_helper:
+                try:
+                    char_clothing_from_items = self.item_context_helper.get_clothing_description_from_items(
+                        char.get('character_id'), brief=True
+                    )
+                    char_clothing = char_clothing_from_items or char_clothing
+                except Exception as e:
+                    logger.debug(f"Failed to get clothing from items for {char.get('name')}: {e}")
+
             context['visible_characters'].append({
                 'name': char.get('name'),
                 'appearance': char.get('physical_appearance'),
                 'stance': char.get('current_stance'),
-                'clothing': char.get('current_clothing')
+                'clothing': char_clothing
             })
 
         # Working memory - fixed 4 turns (excluding atmospheric descriptions)
@@ -285,33 +233,43 @@ What is the current emotional atmosphere?"""
                 'mood_category': 'neutral'
             }
 
-        # Format working memory for prompt
+        # Format working memory for prompt - combine all actions per character per turn
         if witnessed_actions:
-            memory_lines = []
-            for action in witnessed_actions:
-                memory_lines.append(
-                    f"Turn {action['turn_number']}: {action['character_name']} - {action['action_description']}"
-                )
+            memory_lines = _format_combined_turn_history(witnessed_actions)
             context['working_memory'] = "\n".join(memory_lines)
         else:
             context['working_memory'] = "No recent events to recall."
 
-        # Event summaries (short-term summaries)
-        summaries = self.db_session.execute(
-            text("""
-                SELECT * FROM memory_summary_get(
-                    p_game_state_id := :game_state_id,
-                    p_summary_type := 'short_term'
-                )
-                ORDER BY end_turn DESC
-                LIMIT 3
-            """),
-            {"game_state_id": str(self.game_state_id)}
-        ).fetchall()
+        # Tiered memory summaries (with model-aware selection of descriptive vs condensed)
+        from services.memory_summarizer import MemorySummarizer
+        from services.context_manager import ModelContextLimits
 
-        if summaries:
-            summary_texts = [s.summary_text for s in summaries]
-            context['event_summary'] = "\n\n".join(summary_texts)
+        # Determine if we should use descriptive (large models) or condensed (small models) summaries
+        context_limit = ModelContextLimits.get_limit(model)
+        use_descriptive = context_limit >= 100000  # Use descriptive for models with 100K+ token windows
+
+        # Get memory summarizer instance
+        memory_summarizer = MemorySummarizer(self.llm_provider)
+
+        # Get tiered summaries for this character
+        tiered_summaries = memory_summarizer.get_summaries_for_context(
+            db_session=self.db_session,
+            game_state_id=self.game_state_id,
+            character_id=self.character['character_id'],
+            use_descriptive=use_descriptive,
+            exclude_recent_n_turns=memory_window  # Exclude what's in working memory
+        )
+
+        if tiered_summaries:
+            # Format summaries by time window
+            summary_parts = []
+            for summary_info in tiered_summaries:
+                window_label = summary_info['window_type'].replace('_', ' ').title()
+                turn_range = f"{summary_info['start_turn']}-{summary_info['end_turn']}"
+                summary_parts.append(
+                    f"[{window_label} - Turns {turn_range}]\n{summary_info['summary']}"
+                )
+            context['event_summary'] = "\n\n".join(summary_parts)
         else:
             context['event_summary'] = None
 
@@ -345,25 +303,59 @@ What is the current emotional atmosphere?"""
         else:
             context['relationships'] = None
 
-        # Inventory (simple query, no stored procedure exists yet)
-        inventory = self.db_session.execute(
-            text("""
-                SELECT item_name, quantity, item_properties
-                FROM character.character_inventory
-                WHERE character_id = :character_id
-                ORDER BY item_name
-            """),
-            {"character_id": str(self.character['character_id'])}
-        ).fetchall()
+        # Items and Inventory (using Qdrant-based item system)
+        if self.item_context_helper:
+            try:
+                # Get character's inventory (formatted)
+                inventory_text = self.item_context_helper.format_inventory_for_prompt(
+                    character_id=self.character['character_id'],
+                    include_details=False  # Brief format to save tokens
+                )
+                context['inventory'] = inventory_text
 
-        if inventory:
-            inventory_items = []
-            for item in inventory:
-                qty_str = f" x{item.quantity}" if item.quantity > 1 else ""
-                inventory_items.append(f"{item.item_name}{qty_str}")
-            context['inventory'] = ", ".join(inventory_items)
+                # Get relevant items at location (for interaction)
+                visible_items = self.item_context_helper.get_relevant_items_for_context(
+                    location_id=self.location['location_id'],
+                    action_description=None,  # No specific action yet
+                    character_id=self.character['character_id'],
+                    max_items=5  # Limit to avoid token bloat
+                )
+
+                if visible_items:
+                    items_text = self.item_context_helper.format_items_for_prompt(
+                        items=visible_items,
+                        include_details=False  # Brief format
+                    )
+                    context['visible_items'] = items_text
+                else:
+                    context['visible_items'] = None
+
+            except Exception as e:
+                logger.warning(f"Error loading items for context: {e}")
+                context['inventory'] = None
+                context['visible_items'] = None
         else:
-            context['inventory'] = None
+            # Fallback to old inventory system if item system unavailable
+            inventory = self.db_session.execute(
+                text("""
+                    SELECT item_name, quantity, item_properties
+                    FROM character.character_inventory
+                    WHERE character_id = :character_id
+                    ORDER BY item_name
+                """),
+                {"character_id": str(self.character['character_id'])}
+            ).fetchall()
+
+            if inventory:
+                inventory_items = []
+                for item in inventory:
+                    qty_str = f" x{item.quantity}" if item.quantity > 1 else ""
+                    inventory_items.append(f"{item.item_name}{qty_str}")
+                context['inventory'] = ", ".join(inventory_items)
+            else:
+                context['inventory'] = None
+
+            context['visible_items'] = None
 
         return context
 
@@ -374,12 +366,13 @@ class ActionGenerationPrompt:
     """
 
     @staticmethod
-    def build_system_prompt(model: str = None) -> str:
+    def build_system_prompt(model: str = None, character_name: str = None) -> str:
         """
         Build system prompt for action generation.
 
         Args:
             model: Model identifier (optional, for context-aware prompt)
+            character_name: The character's name to use in examples (optional)
 
         Returns:
             System prompt string
@@ -392,26 +385,32 @@ class ActionGenerationPrompt:
             context_limit = ModelContextLimits.get_limit(model)
             is_small_model = context_limit <= 16384
 
+        # Use character_name if provided, otherwise use a placeholder
+        char_placeholder = character_name if character_name else "[the character's full name]"
+
         # Core action types (always included)
-        core_actions = """- think: Private thought (only the character knows)
-- speak: Public dialogue (others hear)
-- interact: Interact with object/character
-- move: Change location
-- attack: Combat action
-- steal: Take something covertly
-- use_item: Use inventory item"""
+        core_actions = f"""- think: Private thought (only the character knows). Write in FIRST PERSON: "I think/wonder/consider... [character's internal monologue]"
+- speak: Public dialogue (what others hear). Write as DIRECT DIALOGUE in first person: "dialogue spoken by character" (do NOT include "I say" or character name, just the dialogue itself)
+- interact: Interact with object/character. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} [verb] the [object/character], [additional sensory detail]"
+- move: Change location. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} moves/walks/runs to [location], [optional detail about how]"
+- attack: Combat action. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} strikes/lunges at [target], [description of attack]"
+- steal: Take something covertly. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} quietly/discreetly takes [item], [description]"
+- use_item: Use inventory item. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} uses/applies/consumes [item], [effect/result]" """
 
         # Atmospheric action types (excluded for small models)
-        atmospheric_actions = """- emote: Body language/gesture (others see)
-- examine: Look at something closely
-- wait: Do nothing/observe
-- hide: Attempt stealth"""
+        atmospheric_actions = f"""- emote: Body language/gesture (others see). Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} [gesture/expression], [detail about body language]"
+- examine: Look at something closely. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} examines/studies [object/person], [what they notice]"
+- wait: Do nothing/observe. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} waits/observes, [what they're watching or thinking]"
+- hide: Attempt stealth. Write in THIRD PERSON with character's FULL NAME: "{char_placeholder} conceals themselves [location/method], [description]" """
 
         # Build action types list
         if is_small_model:
             action_types = core_actions
         else:
             action_types = core_actions + "\n" + atmospheric_actions
+
+        # Build the example with character name
+        example_interact = f'{{"type": "interact", "description": "{char_placeholder} reaches out and gently touches the other character\'s shoulder, her hand lingering for just a moment.", "is_private": false, "target": "character_name"}}'
 
         return f"""You are an expert at generating character action options for a dark fantasy text adventure game.
 
@@ -420,29 +419,30 @@ Your task is to generate distinctive action options for a character's turn. Each
 Action types available:
 {action_types}
 
-CRITICAL RULES:
-1. Generate 5 distinctive options covering different emotional approaches
+CRITICAL NARRATIVE RULES:
+1. Write ALL action descriptions in third-person narrative prose, as if writing a novel, except for think actions (first-person) and speak actions (direct dialogue)
+2. ALWAYS use the character's FULL NAME as the subject of EVERY action description (except think/speak)
+3. Write complete sentences, not fragments or verb phrases
+4. Avoid unclear pronouns - be explicit about who is doing what to whom
+5. Include sensory details and emotional context where appropriate
+6. Check the recent context, if a draft action could not happen within another 30 seconds of game time, replace it with an action that fits but will lead to the same result.
+7. Ensure that the character is responding in some way to any speech or actions directed at them whilst performing the draft action.
+
+STRUCTURE RULES:
+1. Generate 5 distinctive options based on supplied drafts
 2. Each option can contain MULTIPLE actions in sequence (think → speak → act)
-3. Always include at least ONE option that de-escalates the mood/tension
-4. **ANTI-PLATEAU RULE**: Don't repeat the intensity level from previous actions. If escalation is needed, OPTIONS MUST PUSH THE SCENE FORWARD with concrete physical/verbal actions
-5. Show internal thoughts (think actions) to reveal character psychology
-6. Mix public and private actions appropriately
+3. Show internal thoughts (think actions) to reveal character psychology
+4. Mix public and private actions appropriately
+5. Always ensure that there is a speech or interaction action.
 
-**ESCALATION MEANS TAKING ACTION, NOT JUST TALKING ABOUT IT:**
-
-Romantic/Intimate scenes - escalation examples:
-❌ BAD (plateau): "suggests they could get closer" / "talks about intimacy"
-✅ GOOD (escalates): "moves closer and touches their face" / "begins removing an article of clothing" / "pulls them into an embrace" / "initiates a kiss"
-
-Tense/Hostile scenes - escalation examples:
-❌ BAD (plateau): "threatens them verbally" / "talks about fighting"
-✅ GOOD (escalates): "grabs their arm forcefully" / "draws a weapon" / "shoves them against the wall" / "throws a punch"
-
-Social/Political scenes - escalation examples:
-❌ BAD (plateau): "hints at their secret" / "suggests an alliance"
-✅ GOOD (escalates): "reveals the secret directly" / "makes a formal demand" / "offers a binding oath"
-
-**When generating escalating options, characters must DO something concrete, not just talk about doing it.**
+**TURN DURATION RULES:**
+- Each turn = ~30 seconds of in-game time
+- Most actions complete in 1 turn (default)
+- Complex/lengthy actions need 2-5 turns (e.g., searching a room thoroughly, having an extended conversation, intimacy that builds over time)
+- If recent events show a character mid-action with "(XT, Y remaining)" notation:
+  * They are performing a multi-turn action
+  * Some options should CONTINUE that action with turn_duration = Y (the remaining value)
+  * Other options can ABANDON it to do something new (turn_duration = 1 or appropriate for new action)
 
 Format each option as JSON:
 {{
@@ -450,14 +450,26 @@ Format each option as JSON:
   "emotional_tone": "cunning|aggressive|friendly|cautious|romantic|seductive|passionate|lustful|etc",
   "escalates_mood": true/false,
   "deescalates_mood": true/false,
-  "estimated_mood_impact": {{"tension": +/-X, "hostility": +/-X, "romance": +/-X}},
-  "turn_duration": 1-5 (number of turns to complete, 1 turn = ~30 seconds. Actions continuing from previous turn should have reduced duration),
+  "estimated_mood_impact": {{"tension": 5, "hostility": -3, "romance": 0}} (range -10 to 10 for each),
+  "turn_duration": 1-5 (number of turns to complete; if continuing from draft ideas, use the specified duration),
+  "current_stance": "description of character's stance/position after actions: standing by the window|sitting on a chair|lying down|etc. Base on provided current stance but update if actions change it",
+  "current_clothing": "brief but detailed description of clothing appearance after actions. Base on provided current clothing but update if actions change it (disheveled, torn, removed items, etc)",
+  "current_emotional_state": "brief description of character's internal emotional state",
   "actions": [
-    {{"type": "think", "description": "...", "is_private": true}},
-    {{"type": "speak", "description": "...", "is_private": false}},
-    {{"type": "interact", "description": "...", "is_private": false, "target": "character_name"}}
+    {{"type": "think", "description": "I wonder if I can trust this stranger. My mind races with possibilities and doubts—should I reveal my true purpose?", "is_private": true}},
+    {{"type": "speak", "description": "I've been waiting for you. There's something we need to discuss.", "is_private": false}},
+    {example_interact}
   ]
 }}
+
+CRITICAL FORMATTING RULES:
+- think actions: FIRST PERSON internal monologue ("I think...", "I wonder...", etc.)
+- speak actions: DIRECT DIALOGUE only, first person ("Hello," "I need your help," etc.) - do NOT include narrative tags like "I say" or character name
+- All other actions: THIRD PERSON with the character's FULL NAME as subject ("{char_placeholder} reaches out...", "{char_placeholder} walks to...")
+
+IMPORTANT:
+- ALWAYS use the character's FULL NAME in every third-person action description
+- current_stance and current_clothing should maintain continuity with the provided values unless the actions explicitly change them
 
 Return a JSON array of options."""
 
@@ -466,8 +478,7 @@ Return a JSON array of options."""
         context: Dict[str, Any],
         num_escalation: int = None,
         num_neutral: int = None,
-        num_deescalation: int = None,
-        strong_escalation_mode: bool = None
+        num_deescalation: int = None
     ) -> str:
         """
         Build user prompt with full context.
@@ -490,13 +501,12 @@ Return a JSON array of options."""
 
         # Use provided escalation requirements if available (from draft selection)
         # Otherwise calculate them here (legacy behavior)
-        if num_escalation is None or num_neutral is None or num_deescalation is None or strong_escalation_mode is None:
+        if num_escalation is None or num_neutral is None or num_deescalation is None:
             print('mood_guidance:', mood_guidance)
             print('escalation_weight:', escalation_weight)
 
             # Calculate how many escalation vs neutral vs de-escalation options
             total_options = 5
-            strong_escalation_mode = False
 
             if escalation_needed:
                 # De-escalation: 20% chance for 1 de-escalation, 80% chance for STRONG escalation
@@ -509,7 +519,6 @@ Return a JSON array of options."""
                     num_escalation = random.randint(2, 4)
                     # Neutral: make up the remainder
                     num_neutral = total_options - num_escalation - num_deescalation
-                    strong_escalation_mode = False
                 else:
                     # 80% case: STRONG ESCALATION MODE - no de-escalation, bold uninhibited actions
                     num_deescalation = 0
@@ -517,191 +526,75 @@ Return a JSON array of options."""
                     num_escalation = random.randint(2, 4)
                     # Neutral: make up the remainder
                     num_neutral = total_options - num_escalation
-                    strong_escalation_mode = True
             else:
                 num_escalation = 1
                 num_deescalation = 1
                 num_neutral = total_options - 2
-                strong_escalation_mode = False
         else:
             # Using pre-calculated values from draft selection
-            escalation_needed = (num_escalation > 1) or strong_escalation_mode
+            escalation_needed = (num_escalation > 1) 
 
         total_options = num_escalation + num_neutral + num_deescalation
         prompt_parts = []
 
-        # Character identity (relevant attributes only - handled by situational awareness)
+        # Character essentials
         prompt_parts.append(f"CHARACTER: {context['character_name']}")
         prompt_parts.append(f"Emotional state: {context['character_emotional_state']}")
-        prompt_parts.append(f"Current objectives: {context['character_motivations']}")
+        prompt_parts.append(f"Objectives: {context['character_motivations']}")
 
-        # IMMEDIATE CONTEXT - Most recent action(s) for maximum relevance
+        # Current physical state (for continuity)
+        current_stance = context.get('character_stance', 'standing')
+        current_clothing = context.get('character_clothing', 'unchanged')
+        prompt_parts.append(f"Current stance: {current_stance}")
+        prompt_parts.append(f"Current clothing: {current_clothing}")
+
+        # Immediate context (most recent 2-3 actions only)
         if context.get('working_memory'):
-            # Extract just the most recent 1-2 actions
             memory_lines = context['working_memory'].split('\n')
             if memory_lines:
-                immediate_actions = memory_lines[:2]  # Top 2 = most recent
-                prompt_parts.append(f"\nIMMEDIATE CONTEXT (what just happened - DON'T REPEAT THIS INTENSITY LEVEL):")
-                prompt_parts.append('\n'.join(immediate_actions))
+                recent_actions = memory_lines[:3]  # Only last 3 actions
+                prompt_parts.append(f"\nRECENT CONTEXT:")
+                prompt_parts.append('\n'.join(recent_actions))
 
-                # Add explicit plateau warning during escalation
-                if escalation_needed:
-                    prompt_parts.append(
-                        f"\n⚠️ The scene is escalating. Your options MUST go BEYOND what just happened above. "
-                        f"Don't stay at the same level - PUSH FORWARD."
-                    )
-
-        # Time and location (abbreviated - full description not needed every turn)
-        prompt_parts.append(f"\nTIME: {context['time_of_day']}")
-        prompt_parts.append(f"LOCATION: {context['location_name']}")
-        # Omit full location description to save tokens for recent actions
-
-        # Mood
-        prompt_parts.append(f"\nMOOD: {context['mood_description']}")
-
-        # Other characters present
+        # Location and present characters (minimal)
+        prompt_parts.append(f"\nLOCATION: {context['location_name']}")
         if context['visible_characters']:
-            prompt_parts.append("\nPRESENT CHARACTERS:")
-            for char in context['visible_characters']:
-                prompt_parts.append(
-                    f"- {char['name']}: {char['appearance']}. "
-                    f"Currently {char['stance']}. Wearing {char['clothing']}."
-                )
-        else:
-            prompt_parts.append("\nNo other characters present.")
+            char_names = [char['name'] for char in context['visible_characters']]
+            prompt_parts.append(f"PRESENT: {', '.join(char_names)}")
 
-        # Relationships with present characters
-        if context.get('relationships'):
-            prompt_parts.append(f"\nRELATIONSHIPS:")
-            prompt_parts.append(context['relationships'])
+        # Visible items in location
+        if context.get('visible_items'):
+            prompt_parts.append(f"\nVISIBLE ITEMS:\n{context['visible_items']}")
 
-        if escalation_needed:
-            if strong_escalation_mode:
-                prompt_parts.append(
-                    f"\n🔥 STRONG ESCALATION REQUIRED 🔥\n"
-                    f"Generate {num_escalation} options with BOLD, UNINHIBITED actions that drive the {mood_category} mood to GREATER PASSION, "
-                    f"and {num_neutral} neutral options.\n"
-                    f"⚠️ CRITICAL: Strong escalation means going WELL BEYOND normal escalation actions. These should be DRAMATIC, DECISIVE moments that fundamentally change the dynamic."
-                )
-            else:
-                prompt_parts.append(
-                    f"\n⚡ ESCALATION REQUIRED ⚡\n"
-                    f"Generate {num_escalation} options that ACTIVELY ESCALATE the {mood_category} mood, "
-                    f"{num_neutral} neutral options, and {num_deescalation} option(s) that de-escalate."
-                )
-
-            # Add context-specific escalation guidance
-            if mood_category in ['romantic', 'conflicted']:
-                if strong_escalation_mode:
-                    prompt_parts.append(
-                        f"\n💋 STRONG ROMANTIC ESCALATION GUIDANCE:\n"
-                        f"Normal escalation: touching, moving closer, gentle kisses\n"
-                        f"STRONG escalation (REQUIRED): passionate embraces, urgent undressing, explicitly sexual actions, surrendering to desire completely\n"
-                        f"- Go BEYOND tentative touches - be BOLD and PASSIONATE\n"
-                        f"- Characters should act with URGENCY and ABANDON inhibitions\n"
-                        f"- Take actions that are IRREVERSIBLE and cross major intimacy thresholds\n"
-                        f"- Don't use 'step closer' or vague actions - be EXPLICIT about desire and intent\n"
-                        f"- If already kissing, escalate to MORE: clothing removal, explicit touching, moving to bed, etc."
-                    )
-                else:
-                    prompt_parts.append(
-                        f"\n💋 ROMANTIC ESCALATION GUIDANCE:\n"
-                        f"- Take PHYSICAL actions: touching, moving closer, removing clothing, embracing, kissing, or more sensual actions\n"
-                        f"- Make BOLD requests or propositions, not hints\n"
-                        f"- Show desire through ACTION, not just words\n"
-                        f"- Don't plateau - if characters are already close, the next step is MORE intimate\n"
-                        f"- Don't use 'step closer' or similar vague actions"
-                    )
-            elif mood_category == 'hostile':
-                if strong_escalation_mode:
-                    prompt_parts.append(
-                        f"\n⚔️ STRONG HOSTILE ESCALATION GUIDANCE:\n"
-                        f"Normal escalation: grabbing, shoving, drawing weapons\n"
-                        f"STRONG escalation (REQUIRED): actual violence, brutal attacks, life-threatening actions, crossing the point of no return\n"
-                        f"- Go BEYOND threats - ATTACK with full force\n"
-                        f"- Actions should cause REAL harm and danger\n"
-                        f"- Take actions that CANNOT be taken back\n"
-                        f"- If weapons are drawn, USE them decisively"
-                    )
-                else:
-                    prompt_parts.append(
-                        f"\n⚔️ HOSTILE ESCALATION GUIDANCE:\n"
-                        f"- Take PHYSICAL actions: grabbing, shoving, weapon-drawing, attacking\n"
-                        f"- Make DIRECT threats or demands, not hints\n"
-                        f"- Show aggression through ACTION, not just words\n"
-                        f"- Don't plateau - if tension is high, violence or forceful action comes next"
-                    )
-            elif mood_category == 'tense':
-                if strong_escalation_mode:
-                    prompt_parts.append(
-                        f"\n⚡ STRONG TENSION ESCALATION GUIDANCE:\n"
-                        f"Normal escalation: revealing hints, making veiled demands\n"
-                        f"STRONG escalation (REQUIRED): explosive revelations, ultimatums, power plays that force immediate consequences\n"
-                        f"- REVEAL major secrets completely, not hints\n"
-                        f"- Make ULTIMATUMS and demands with real stakes\n"
-                        f"- Take actions that FORCE the other character to respond dramatically\n"
-                        f"- Create moments of NO RETURN"
-                    )
-                else:
-                    prompt_parts.append(
-                        f"\n⚡ TENSION ESCALATION GUIDANCE:\n"
-                        f"- Increase stakes with ACTIONS: revealing secrets, making demands, physical closeness\n"
-                        f"- Take risks that change the power dynamic\n"
-                        f"- Don't plateau - tension requires RELEASE through action or conflict"
-                    )
-        else:
-            prompt_parts.append(
-                f"\nGenerate {num_escalation} option(s) that could escalate, "
-                f"{num_neutral} neutral options, and {num_deescalation} "
-                f"option(s) that de-escalate."
-            )
-
-        prompt_parts.append(
-            "\n🎭 ANTI-PLATEAU REQUIREMENT:\n"
-            "DO NOT generate options that:\n"
-            "- Repeat the same intensity as the most recent action\n"
-            "- Just talk about doing something instead of doing it\n"
-            "- Suggest or hint instead of taking concrete action\n"
-            "- Stay at the current intimacy/tension level without progressing\n"
-            "\nEach option must be DISTINCTIVE and move the scene in a clear direction."
-        )
-
-        # Working memory (past 5-10 turns) - full history for context
-        if context.get('working_memory'):
-            prompt_parts.append(f"\nRECENT EVENTS (full history, newest first):")
-            prompt_parts.append(context['working_memory'])
-
-        # Event summary (if available)
-        if context.get('event_summary'):
-            prompt_parts.append(f"\nSESSION SUMMARY:")
-            prompt_parts.append(context['event_summary'])
-
-        # Inventory
+        # Character's inventory
         if context.get('inventory'):
-            prompt_parts.append(f"\nINVENTORY: {context['inventory']}")
+            prompt_parts.append(f"\nYOUR INVENTORY:\n{context['inventory']}")
 
-        # Generation instructions based on mood
-        print('escalation_needed:', escalation_needed)
-        print('strong_escalation_mode:', strong_escalation_mode)
+        # Mood description
+        if context.get('mood_description'):
+            prompt_parts.append(f"\nMOOD: {context['mood_description']}")
 
-        # Include selected draft summaries as seed ideas (if available)
+        # Include selected draft summaries to expand
         if context.get('selected_draft_summaries'):
-            prompt_parts.append(f"\n{'='*80}")
-            prompt_parts.append(f"CRITICAL INSTRUCTION: EXPAND THESE {total_options} SELECTED ACTION IDEAS")
-            prompt_parts.append(f"{'='*80}")
-            prompt_parts.append("\nYou MUST expand each of the following action ideas into a full action sequence.")
-            prompt_parts.append("DO NOT generate new ideas - ONLY expand the ones listed below:\n")
+            prompt_parts.append(f"\n{'='*60}")
+            prompt_parts.append(f"EXPAND THESE {total_options} ACTION IDEAS WITH NARRATIVE DETAIL")
+            prompt_parts.append(f"{'='*60}\n")
             for i, summary in enumerate(context['selected_draft_summaries'], 1):
-                prompt_parts.append(f"  {i}. {summary}")
-            prompt_parts.append("\nFor EACH idea above, create a complete action sequence with:")
-            prompt_parts.append("- Private thought (think action) revealing character's internal state")
-            prompt_parts.append("- Dialogue (speak action) if appropriate")
-            prompt_parts.append("- Physical action (interact/emote/etc) bringing the idea to life")
-            prompt_parts.append(f"\n{'='*80}\n")
+                prompt_parts.append(f"{i}. {summary}")
+            prompt_parts.append(f"\nFor each idea, create a rich action sequence:")
+            prompt_parts.append(f"- ALWAYS use '{context['character_name']}' as the subject in every action description")
+            prompt_parts.append("- Write in third-person narrative prose (like a novel)")
+            prompt_parts.append("- Add character's internal thoughts")
+            prompt_parts.append("- Include dialogue if they speak")
+            prompt_parts.append("- Describe physical actions with sensory detail")
+            prompt_parts.append("- Set turn_duration appropriately (check draft for multi-turn actions)")
+            prompt_parts.append(f"{'='*60}\n")
         else:
-            prompt_parts.append(f"\n--- GENERATE {total_options} DISTINCTIVE ACTION OPTIONS ---")
+            prompt_parts.append(f"\nGenerate {total_options} distinctive action options.")
+            prompt_parts.append(f"- ALWAYS use '{context['character_name']}' as the subject in every action description")
+            prompt_parts.append("- Write in third-person narrative prose (like a novel)")
 
-        prompt_parts.append("\nReturn a JSON array of options as specified in the system prompt.")
+        prompt_parts.append("\nReturn JSON array as specified in system prompt.")
 
         return "\n".join(prompt_parts)
 
@@ -721,10 +614,9 @@ class ActionGenerator:
     - Provider-specific prompt adaptation
     - Graceful degradation to fallback options
 
-    LLM CALLS WITH FALLBACK:
-    1. _analyze_mood_from_actions() - Mood detection from recent actions
-    2. _generate_draft_options() - Generate 20 varied draft options
-    3. generate_options() - Final detailed action generation
+    LLM CALLS WITH FALLBACK (2-STEP PROCESS):
+    1. _generate_draft_options() - Generate 20 varied draft options + inline mood analysis
+    2. generate_options() - Final detailed action generation from selected drafts
 
     All calls will automatically try providers in this order:
     - Anthropic Claude (primary)
@@ -788,30 +680,48 @@ class ActionGenerator:
         if context.get('working_memory'):
             memory_lines = context['working_memory'].split('\n')
             if memory_lines:
-                # Get last few actions for emotional tone analysis
-                immediate_context = '\n'.join(memory_lines[:4])
-
-                # Parse to find character's last turn and others' actions since
-                for line in memory_lines:
+                # Find the character's MOST RECENT turn (last occurrence, not first)
+                character_last_turn_index = None
+                for i, line in enumerate(memory_lines):
                     if context['character_name'] in line:
-                        if character_last_turn is None:
-                            character_last_turn = line
-                    elif character_last_turn is not None:
-                        # This is after character's last turn
-                        others_actions_since.append(line)
+                        character_last_turn_index = i
+                        character_last_turn = line
+
+                # Get all actions from character's last turn onward
+                if character_last_turn_index is not None:
+                    # Include character's last turn AND everything after it
+                    actions_from_last_turn = memory_lines[character_last_turn_index:]
+
+                    # Use this as immediate context (all actions since character's last turn)
+                    immediate_context = '\n'.join(actions_from_last_turn)
+
+                    # Others' actions are everything AFTER the character's last turn
+                    if character_last_turn_index < len(memory_lines) - 1:
+                        others_actions_since = memory_lines[character_last_turn_index + 1:]
+                else:
+                    # Character hasn't acted yet in working memory, use recent context
+                    immediate_context = '\n'.join(memory_lines[-5:])  # Last 5 turns
 
         # Build comprehensive prompt that does BOTH mood analysis AND draft generation
         draft_system_prompt = f"""You are generating action ideas for a character in a dark fantasy game.
 
 Your task is TWO-FOLD:
 1. Analyze the emotional tone/atmosphere from recent actions
-2. Generate {num_drafts} diverse action ideas that proceed from the recent acctions and give each action idea an escalation score
+2. Generate {num_drafts} diverse action ideas that directly proceed from the recent actions and give each action idea an escalation score
 
 For MOOD ANALYSIS, consider:
 - Emotional tone of recent events (calm, tense, romantic, hostile, etc.)
 - Escalation trajectory (de-escalating, stable, escalating)
 
 For ACTION IDEAS, each turn represents ~30 seconds of in-game time. Actions that take longer should specify turn_duration > 1.
+
+IMPORTANT: In the recent events, look for actions with turn duration notation like "(3T, 2 remaining)" which indicates:
+- The action takes 3 turns total
+- 2 turns remain to complete it
+- The character is in the middle of performing this action
+- Ensure that the action ideas directly respond to the most recent events, including any speech or actions directed at the character
+
+When a character is continuing a multi-turn action, REDUCE the turn_duration for continuation options by the number of turns already spent.
 
 Return a JSON object with TWO sections:
 {{
@@ -825,7 +735,7 @@ Return a JSON object with TWO sections:
     {{
       "summary": "1-2 sentence action description",
       "escalation_score": -10 to +10,
-      "turn_duration": 1-5 (estimated turns to complete, default 1)
+      "turn_duration": 1-5 (estimated turns to complete; if continuing an action, use the remaining_duration value)
     }},
     ...{num_drafts} total...
   ]
@@ -833,14 +743,19 @@ Return a JSON object with TWO sections:
 
         # Build context-aware user prompt
         continuing_action_note = ""
+        multi_turn_instructions = ""
         if character_last_turn:
-            continuing_action_note = f"\nNOTE: Character's last action: {character_last_turn}"
-            # Check if this might be a multi-turn action (we'll look for duration metadata later)
-            continuing_action_note += f"\nIf this was a multi-turn action, include several options that CONTINUE it with reduced turn_duration."
+            continuing_action_note = f"\n\nCHARACTER'S MOST RECENT ACTION:\n{character_last_turn}"
 
-        others_note = ""
-        if others_actions_since:
-            others_note = f"\nACTIONS BY OTHERS SINCE CHARACTER'S LAST TURN:\n" + '\n'.join(others_actions_since[:3])
+            # Check if the last action has turn duration info
+            if "T" in character_last_turn and "remaining" in character_last_turn:
+                continuing_action_note += "\n\n⚠️ IMPORTANT: This character is in the middle of a multi-turn action!"
+                multi_turn_instructions = """
+MULTI-TURN ACTION HANDLING:
+- Generate several options (30-40% of total) that CONTINUE the current multi-turn action
+- For continuation options, use the "remaining" number as the turn_duration
+- Also generate some options that ABANDON the current action to do something else
+- Example: If action shows "(4T, 3 remaining)", continuation options should have turn_duration: 3"""
 
         draft_user_prompt = f"""CHARACTER: {context['character_name']}
 Emotional state: {context['character_emotional_state']}
@@ -848,25 +763,30 @@ Short-term objectives: {context['character_motivations']}
 
 LOCATION: {context['location_name']}
 
-RECENT EVENTS (for mood analysis and context):
-{immediate_context if immediate_context else 'Scene is just beginning'}{continuing_action_note}{others_note}
+RECENT EVENTS (all actions since character's last turn, including their last turn):
+{immediate_context if immediate_context else 'Scene is just beginning'}{continuing_action_note}
 
 OTHER CHARACTERS PRESENT:
 {', '.join([c['name'] for c in context['visible_characters']]) if context['visible_characters'] else 'None'}
+{multi_turn_instructions}
 
 TASK:
 1. Analyze the emotional tone/mood from the recent events
 2. Generate {num_drafts} varied action ideas:
    - Range from strong de-escalation (-10) to strong escalation (+10)
-   - Include mix across full spectrum
-   - Consider character's objectives
-   - Estimate turn_duration (1 turn = ~30 seconds)
-   - If character was performing multi-turn action, include options to CONTINUE it
+   - Include mix across full spectrum but only action that could be performed 30 seconds after the most recent events
+   - Consider character's objectives and emotional state
+   - Pay attention to turn_duration notation in recent events (XT, Y remaining)
+   - Set appropriate turn_duration for each action (1 turn = ~30 seconds)
+   - If character is mid-action, include continuation options with correct remaining duration
+   - If a speech or an action has been directed at the character in the recent events, ensure that the options responds to it, including deciding to ignore it
 
 Return the JSON object as specified."""
 
+        #print ("draft_user_prompt", draft_user_prompt)
         logger.info(f"Generating {num_drafts} draft options with inline mood analysis...")
         print(f"\n🎲 Generating {num_drafts} draft options with inline mood analysis (2-in-1 LLM call)...")
+
 
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -888,6 +808,7 @@ Return the JSON object as specified."""
                 logger.info(f"Draft generation response length: {len(response)} chars")
                 logger.debug(f"Draft generation response: {response[:500]}...")
                 print(f"📄 Draft response length: {len(response)} chars")
+                #print(f"📄 Draft response: {response}")
 
                 # Check for empty response
                 if not response or not response.strip():
@@ -928,6 +849,7 @@ Return the JSON object as specified."""
                 print(f"🔍 Parsing JSON object ({len(json_str)} chars)...")
 
                 result = json.loads(json_str)
+                #print("result:", result)
 
                 # Validate structure
                 if not isinstance(result, dict):
@@ -1181,7 +1103,6 @@ Return the JSON object as specified."""
         )
         context = context_builder.build(model=self.llm_provider.model_name)
 
-        #print('Generated context for action generation:', context)
         print('Initial mood guidance (from DB):', context['mood_guidance'])
 
         # STAGE 1: Generate draft options with escalation scores AND inline mood analysis (2-in-1)
@@ -1191,7 +1112,7 @@ Return the JSON object as specified."""
         context['mood_guidance'] = mood_guidance
 
         # Print draft options for monitoring
-        print(f"\n📋 Generated {len(draft_options)} draft options:")
+        #print(f"\n📋 Generated {len(draft_options)} draft options:")
         for i, draft in enumerate(draft_options, 1):
             score = draft.get('escalation_score', 0)
             duration = draft.get('turn_duration', 1)
@@ -1238,11 +1159,21 @@ Return the JSON object as specified."""
             emoji = "🔥" if score >= 6 else "⚡" if score > 2 else "➡️" if score >= -2 else "🕊️"
             print(f"  {i}. [{score:+3d}] {emoji} {draft.get('summary', 'No summary')}")
 
-        # Add selected drafts to context for final generation
-        context['selected_draft_summaries'] = [d.get('summary') for d in selected_drafts]
+        # Add selected drafts to context for final generation (include turn_duration info)
+        draft_summaries = []
+        for d in selected_drafts:
+            summary = d.get('summary', 'No summary')
+            turn_duration = d.get('turn_duration', 1)
+            if turn_duration > 1:
+                summary += f" [Duration: {turn_duration} turns]"
+            draft_summaries.append(summary)
+        context['selected_draft_summaries'] = draft_summaries
 
-        # Build prompts (pass pre-calculated escalation requirements)
-        system_prompt = self.prompt_builder.build_system_prompt(model=self.llm_provider.model_name)
+        # Build prompts (pass pre-calculated escalation requirements and character name)
+        system_prompt = self.prompt_builder.build_system_prompt(
+            model=self.llm_provider.model_name,
+            character_name=character.get('name')
+        )
         user_prompt = self.prompt_builder.build_user_prompt(
             context,
             num_escalation=num_escalation,
@@ -1253,9 +1184,9 @@ Return the JSON object as specified."""
         logger.debug(f"System prompt: {system_prompt[:200]}...")
         logger.debug(f"User prompt: {user_prompt[:500]}...")
 
-        #print(f"System prompt: {system_prompt[:200]}...")
         print(f"\n📝 User prompt length: {len(user_prompt)} chars")
         print(f"📝 System prompt length: {len(system_prompt)} chars")
+        print("user_prompt", user_prompt)
 
         # Call LLM
         try:
@@ -1276,33 +1207,77 @@ Return the JSON object as specified."""
                     # Build actions from the dict
                     actions = []
 
-                    # Handle different response formats
-                    if opt.get('private_thought'):
-                        actions.append(SingleAction(
-                            action_type=ActionType.THINK,
-                            description=opt['private_thought'],
-                            is_private=True
-                        ))
-                    if opt.get('dialogue') or opt.get('speech'):
-                        actions.append(SingleAction(
-                            action_type=ActionType.SPEAK,
-                            description=opt.get('dialogue') or opt.get('speech'),
-                            is_private=False
-                        ))
-                    if opt.get('action'):
-                        actions.append(SingleAction(
-                            action_type=ActionType.INTERACT,
-                            description=opt['action'],
-                            is_private=False
-                        ))
+                    # NEW FORMAT: Check if there's an 'actions' array (new structured format)
+                    if opt.get('actions') and isinstance(opt['actions'], list):
+                        for action_dict in opt['actions']:
+                            action_type_str = action_dict.get('type', 'interact')
+                            # Map string to ActionType enum
+                            action_type_map = {
+                                'think': ActionType.THINK,
+                                'speak': ActionType.SPEAK,
+                                'interact': ActionType.INTERACT,
+                                'move': ActionType.MOVE,
+                                'attack': ActionType.ATTACK,
+                                'steal': ActionType.STEAL,
+                                'use_item': ActionType.USE_ITEM,
+                                'emote': ActionType.EMOTE,
+                                'examine': ActionType.EXAMINE,
+                                'wait': ActionType.WAIT,
+                                'hide': ActionType.HIDE
+                            }
+                            action_type = action_type_map.get(action_type_str, ActionType.INTERACT)
+
+                            # Handle target field (can be character name or object)
+                            target = action_dict.get('target')
+                            target_character_id = None
+                            target_object = None
+
+                            if target:
+                                # For now, assume targets are character names (can be enhanced later)
+                                # The name will be resolved to character_id during execution
+                                target_object = target  # Store as object name for now
+
+                            actions.append(SingleAction(
+                                action_type=action_type,
+                                description=action_dict.get('description', ''),
+                                is_private=action_dict.get('is_private', False),
+                                target_character_id=target_character_id,
+                                target_object=target_object
+                            ))
+
+                    # OLD FORMAT: Fallback to old field names for backwards compatibility
+                    else:
+                        if opt.get('private_thought'):
+                            actions.append(SingleAction(
+                                action_type=ActionType.THINK,
+                                description=opt['private_thought'],
+                                is_private=True
+                            ))
+                        if opt.get('dialogue') or opt.get('speech'):
+                            actions.append(SingleAction(
+                                action_type=ActionType.SPEAK,
+                                description=opt.get('dialogue') or opt.get('speech'),
+                                is_private=False
+                            ))
+                        if opt.get('action'):
+                            actions.append(SingleAction(
+                                action_type=ActionType.INTERACT,
+                                description=opt['action'],
+                                is_private=False
+                            ))
 
                     if actions:
                         sequence = ActionSequence(
                             actions=actions,
                             summary=opt.get('summary', f'Option {idx}'),
-                            escalates_mood=False,
-                            deescalates_mood=False,
-                            emotional_tone='neutral'
+                            escalates_mood=opt.get('escalates_mood', False),
+                            deescalates_mood=opt.get('deescalates_mood', False),
+                            emotional_tone=opt.get('emotional_tone', 'neutral'),
+                            estimated_mood_impact=opt.get('estimated_mood_impact', {}),
+                            turn_duration=opt.get('turn_duration', 1),
+                            current_stance=opt.get('current_stance', 'standing'),
+                            current_clothing=opt.get('current_clothing', 'unchanged'),
+                            current_emotional_state=opt.get('current_emotional_state', 'neutral')
                         )
                         options.append(ActionOption(
                             option_id=idx,
@@ -1334,6 +1309,7 @@ Return the JSON object as specified."""
 
                         # Parse response into action sequences
                         options = self._parse_response(response, context)
+                        print("action-option response:", response)
 
                         # Success!
                         break
@@ -1351,12 +1327,8 @@ Return the JSON object as specified."""
                 if options is None:
                     # This shouldn't happen, but just in case
                     raise ValueError("Failed to generate options after retries")
-
-            # Validate we have required de-escalation option
-            #deescalation_options = [opt for opt in options if opt.sequence.deescalates_mood]
-            #if not deescalation_options:
-            #    logger.warning("No de-escalation option generated, adding fallback")
-            #    options.append(self._create_fallback_deescalation(character, location))
+                
+            
 
             # Create result
             result = GeneratedActionOptions(
@@ -1477,7 +1449,9 @@ Return the JSON object as specified."""
                     deescalates_mood=option_data.get('deescalates_mood', False),
                     emotional_tone=option_data.get('emotional_tone', 'neutral'),
                     estimated_mood_impact=option_data.get('estimated_mood_impact', {}),
-                    turn_duration=option_data.get('turn_duration', 1)
+                    turn_duration=option_data.get('turn_duration', 1),
+                    current_stance=option_data.get('current_stance', 'standing'),
+                    current_clothing=option_data.get('current_clothing', 'unchanged')
                 )
 
                 # Create option
@@ -1504,39 +1478,6 @@ Return the JSON object as specified."""
             logger.error(f"Error parsing LLM response: {e}", exc_info=True)
             logger.debug(f"Response was: {response[:1000]}...")
             raise
-
-    def _create_fallback_deescalation(
-        self,
-        character: Dict[str, Any],
-        location: Dict[str, Any]
-    ) -> ActionOption:
-        """Create a fallback de-escalation option."""
-        sequence = ActionSequence(
-            actions=[
-                SingleAction(
-                    action_type=ActionType.THINK,
-                    description=f"{character['name']} thinks about calming the situation",
-                    is_private=True
-                ),
-                SingleAction(
-                    action_type=ActionType.EMOTE,
-                    description=f"{character['name']} takes a deep breath and relaxes their posture",
-                    is_private=False
-                ),
-                SingleAction(
-                    action_type=ActionType.SPEAK,
-                    description=f"{character['name']} says calmly, \"Let's all take a moment.\"",
-                    is_private=False
-                )
-            ],
-            summary="Attempt to calm the situation",
-            escalates_mood=False,
-            deescalates_mood=True,
-            emotional_tone="calming",
-            estimated_mood_impact={'tension': -10, 'hostility': -5}
-        )
-
-        return ActionOption(option_id=99, sequence=sequence, selection_weight=1.0)
 
     def _create_fallback_options(
         self,

@@ -64,11 +64,11 @@ PROVIDER_CONFIG: Dict[str, Any] = {
         },
         {
             "provider": "together_ai",
-            "model": "meta-llama/Llama-3-70b-chat-hf",
+            "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
             "enabled": bool(os.getenv("TOGETHER_API_KEY")),
             "priority": 7,
             "use_for": ["mature", "unrestricted"],
-            "notes": "Together.ai backup for Llama 70B"
+            "notes": "Together.ai Llama 3.1 70B Instruct (more permissive than chat-hf)"
         },
         {
             "provider": "aimlapi",

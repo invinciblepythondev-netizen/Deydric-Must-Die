@@ -1,362 +1,567 @@
 """
 Memory Summarization Service
 
-Summarizes recent turn history into compressed narrative summaries.
-Uses Claude Haiku for cost efficiency (10x cheaper than Sonnet).
+Generates tiered memory summaries for characters using LLMs.
+Creates both descriptive (for large context models) and condensed versions.
+
+SUMMARY TIERS:
+- recent_10: Last 10 turns
+- rolling_50: Last 50 turns (rolling window)
+- rolling_100: Last 100 turns (rolling window)
+- deep_720: Last 720 turns (~6 hours in-game at 30s/turn)
+- deep_1440: Last 1440 turns (~12 hours)
+- deep_2880: Last 2880 turns (~24 hours)
+- deep_5760: Last 5760 turns (~48 hours)
 """
 
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any, Tuple
 from uuid import UUID
-from datetime import datetime
-from database import db
 from sqlalchemy import text
-from .llm.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
 
 class MemorySummarizer:
     """
-    Summarizes turn history into narrative summaries for LLM context.
+    Generates memory summaries at different time tiers for characters.
 
-    Uses cheap models (Claude Haiku) since summarization doesn't require
-    the full capability of more expensive models.
+    Each summary has two versions:
+    - Descriptive: Rich narrative prose (200-400 words) for large context models (128K+ tokens)
+    - Condensed: Concise bullet-point style (50-100 words) for small context models (8-32K tokens)
     """
 
-    def __init__(self, llm_provider: LLMProvider):
+    def __init__(self, llm_provider, vector_store=None):
         """
-        Args:
-            llm_provider: LLM provider to use (should be cheap model like Haiku)
-        """
-        self.llm = llm_provider
-
-    def summarize_recent_turns(
-        self,
-        game_id: UUID,
-        start_turn: int,
-        end_turn: int,
-        summary_type: str = "short_term"
-    ) -> UUID:
-        """
-        Summarize a range of turns into a narrative summary.
+        Initialize summarizer with LLM provider.
 
         Args:
-            game_id: Game state ID
-            start_turn: Starting turn number
-            end_turn: Ending turn number
-            summary_type: Type of summary (short_term, session, game)
-
-        Returns:
-            UUID of created summary
-
-        Raises:
-            ValueError: If no turns found in range
+            llm_provider: LLM provider instance (for generating summaries)
+            vector_store: Optional VectorStoreService instance (for embedding summaries)
         """
-        # Get turn history for this range
-        turns = self._get_turns_for_range(game_id, start_turn, end_turn)
+        self.llm_provider = llm_provider
+        self.vector_store = vector_store
 
-        if not turns:
-            raise ValueError(
-                f"No turns found for game {game_id} between turns {start_turn}-{end_turn}"
-            )
-
-        logger.info(
-            f"Summarizing {len(turns)} turn records from turns {start_turn}-{end_turn}"
-        )
-
-        # Build prompt for summarization
-        prompt = self._build_summarization_prompt(turns, start_turn, end_turn)
-
-        # Generate summary using LLM (Claude Haiku)
-        try:
-            summary_text = self.llm.generate(
-                system_prompt=self._get_system_prompt(),
-                user_prompt=prompt,
-                model="claude-3-5-haiku-20241022"  # Explicitly use Haiku
-            )
-        except Exception as e:
-            logger.error(f"Failed to generate summary: {e}")
-            # Fallback: create basic bullet-point summary
-            summary_text = self._create_fallback_summary(turns)
-
-        # Store summary in database
-        summary_id = self._store_summary(
-            game_id, start_turn, end_turn, summary_text, summary_type
-        )
-
-        logger.info(
-            f"Created summary {summary_id} for turns {start_turn}-{end_turn} "
-            f"({len(summary_text)} chars)"
-        )
-
-        return summary_id
-
-    def get_recent_summaries(
+    def generate_summary_for_window(
         self,
-        game_id: UUID,
-        limit: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Get recent summaries for a game.
-
-        Args:
-            game_id: Game state ID
-            limit: Maximum number of summaries to return
-
-        Returns:
-            List of summary dictionaries
-        """
-        result = db.session.execute(
-            text("""
-                SELECT summary_id, start_turn, end_turn, summary_text,
-                       summary_type, created_at
-                FROM memory.memory_summary
-                WHERE game_state_id = :game_id
-                ORDER BY end_turn DESC
-                LIMIT :limit
-            """),
-            {"game_id": str(game_id), "limit": limit}
-        )
-
-        summaries = []
-        for row in result:
-            summaries.append({
-                "summary_id": row.summary_id,
-                "start_turn": row.start_turn,
-                "end_turn": row.end_turn,
-                "summary_text": row.summary_text,
-                "summary_type": row.summary_type,
-                "created_at": row.created_at
-            })
-
-        return summaries
-
-    def _get_turns_for_range(
-        self,
-        game_id: UUID,
+        db_session,
+        game_state_id: UUID,
+        character_id: UUID,
+        window_type: str,
         start_turn: int,
         end_turn: int
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[str, str]:
         """
-        Get all turn records for a range.
+        Generate both descriptive and condensed summaries for a turn window.
 
         Args:
-            game_id: Game state ID
+            db_session: Database session
+            game_state_id: Game state UUID
+            character_id: Character UUID
+            window_type: Type of window (recent_10, rolling_50, etc.)
             start_turn: Starting turn number
-            end_turn: Ending turn number
+            end_turn: Ending turn number (inclusive)
 
         Returns:
-            List of turn records
+            Tuple of (descriptive_summary, condensed_summary)
         """
-        result = db.session.execute(
+        # Get character name using stored procedure
+        character_result = db_session.execute(
+            text("SELECT * FROM character_get(:id)"),
+            {"id": str(character_id)}
+        ).fetchone()
+
+        if not character_result:
+            raise ValueError(f"Character {character_id} not found")
+
+        character_name = character_result.name
+
+        # Get turn history for this character in this window
+        turn_history = db_session.execute(
             text("""
                 SELECT
-                    th.turn_number,
-                    th.sequence_number,
-                    c.name as character_name,
-                    th.action_type,
-                    th.action_description,
-                    th.is_private,
-                    th.outcome_description,
-                    th.was_successful,
-                    l.name as location_name
-                FROM memory.turn_history th
-                JOIN character.character c ON c.character_id = th.character_id
-                LEFT JOIN world.location l ON l.location_id = th.location_id
-                WHERE th.game_state_id = :game_id
-                  AND th.turn_number >= :start_turn
-                  AND th.turn_number <= :end_turn
-                ORDER BY th.turn_number ASC, th.sequence_number ASC
+                    turn_number,
+                    sequence_number,
+                    action_type,
+                    action_description,
+                    is_private
+                FROM memory.turn_history
+                WHERE game_state_id = :game_id
+                  AND turn_number BETWEEN :start_turn AND :end_turn
+                  AND (
+                    character_id = :character_id
+                    OR :character_id = ANY(
+                        SELECT jsonb_array_elements_text(witnesses)::uuid
+                    )
+                  )
+                  AND action_type != 'atmospheric'
+                ORDER BY turn_number ASC, sequence_number ASC
             """),
             {
-                "game_id": str(game_id),
+                "game_id": str(game_state_id),
+                "character_id": str(character_id),
                 "start_turn": start_turn,
                 "end_turn": end_turn
             }
-        )
+        ).fetchall()
 
-        turns = []
-        for row in result:
-            turns.append({
-                "turn_number": row.turn_number,
-                "sequence_number": row.sequence_number,
-                "character_name": row.character_name,
-                "action_type": row.action_type,
-                "action_description": row.action_description,
-                "is_private": row.is_private,
-                "outcome_description": row.outcome_description,
-                "was_successful": row.was_successful,
-                "location_name": row.location_name
-            })
+        if not turn_history:
+            logger.warning(f"No turn history found for {character_name} in turns {start_turn}-{end_turn}")
+            return (
+                f"No significant events occurred for {character_name} during turns {start_turn}-{end_turn}.",
+                f"No events (turns {start_turn}-{end_turn})."
+            )
 
-        return turns
+        # Format turn history for LLM
+        history_lines = []
+        for row in turn_history:
+            turn_num, seq_num, action_type, description, is_private = row
+            privacy_tag = " [private]" if is_private else ""
+            history_lines.append(f"Turn {turn_num}.{seq_num} ({action_type}): {description}{privacy_tag}")
 
-    def _store_summary(
-        self,
-        game_id: UUID,
-        start_turn: int,
-        end_turn: int,
-        summary_text: str,
-        summary_type: str
-    ) -> UUID:
-        """
-        Store summary in database.
+        history_text = "\n".join(history_lines)
+        turn_count = end_turn - start_turn + 1
 
-        Args:
-            game_id: Game state ID
-            start_turn: Starting turn number
-            end_turn: Ending turn number
-            summary_text: Summary text
-            summary_type: Type of summary
+        # Build prompt for summary generation
+        system_prompt = """You are a narrative summarizer for a dark fantasy text adventure game.
 
-        Returns:
-            UUID of created summary
-        """
-        result = db.session.execute(
-            text("""
-                INSERT INTO memory.memory_summary (
-                    game_state_id, start_turn, end_turn,
-                    summary_text, summary_type
-                )
-                VALUES (
-                    :game_id, :start_turn, :end_turn,
-                    :summary_text, :summary_type
-                )
-                RETURNING summary_id
-            """),
-            {
-                "game_id": str(game_id),
-                "start_turn": start_turn,
-                "end_turn": end_turn,
-                "summary_text": summary_text,
-                "summary_type": summary_type
-            }
-        )
+Your task is to create TWO versions of a summary for a character's experiences:
 
-        db.session.commit()
-        summary_id = result.scalar()
+1. DESCRIPTIVE VERSION (200-400 words):
+   - Rich narrative prose suitable for large context models
+   - Include emotional nuances, motivations, and character development
+   - Capture the narrative arc and key moments
+   - Write in third-person past tense from an omniscient narrator perspective
 
-        return UUID(summary_id)
+2. CONDENSED VERSION (50-100 words):
+   - Concise bullet-point style suitable for small context models
+   - Focus only on most significant events and outcomes
+   - Omit minor details and atmospheric descriptions
+   - Still maintain narrative coherence
 
-    def _build_summarization_prompt(
-        self,
-        turns: List[Dict[str, Any]],
-        start_turn: int,
-        end_turn: int
-    ) -> str:
-        """
-        Build prompt for LLM summarization.
+Return the summaries as JSON:
+{
+  "descriptive_summary": "...",
+  "condensed_summary": "..."
+}
 
-        Args:
-            turns: List of turn records
-            start_turn: Starting turn number
-            end_turn: Ending turn number
+IMPORTANT: Return ONLY valid JSON. No markdown code blocks, no extra text."""
 
-        Returns:
-            Formatted prompt string
-        """
-        # Format turns as narrative
-        turn_text_blocks = []
+        user_prompt = f"""Character: {character_name}
+Time Period: Turns {start_turn}-{end_turn} ({turn_count} turns, ~{turn_count * 0.5:.0f} minutes in-game)
+Window Type: {window_type}
 
-        for turn in turns:
-            turn_num = turn["turn_number"]
-            seq_num = turn["sequence_number"]
-            char_name = turn["character_name"]
-            action = turn["action_description"]
-            outcome = turn["outcome_description"]
-            location = turn["location_name"] or "unknown location"
-            is_private = turn["is_private"]
+Events that {character_name} experienced or witnessed:
+{history_text}
 
-            # Format the turn entry
-            entry = f"Turn {turn_num}"
-            if seq_num > 0:
-                entry += f".{seq_num}"
-            entry += f" - {char_name} at {location}"
+Generate both descriptive and condensed summaries of this period from {character_name}'s perspective."""
 
-            if is_private:
-                entry += " (private thought)"
+        # Retry logic: Try up to 3 times (initial + 2 retries) if JSON parsing fails
+        max_attempts = 3
+        last_error = None
 
-            entry += f":\n  {action}"
+        try:
+            for attempt in range(max_attempts):
+                try:
+                    if attempt > 0:
+                        print(f"\n[MemorySummarizer] Retry attempt {attempt}/{max_attempts-1}")
+                        logger.info(f"Retrying summary generation (attempt {attempt + 1}/{max_attempts})")
 
-            if outcome:
-                entry += f"\n  Outcome: {outcome}"
+                    # Generate summary using LLM
+                    logger.info(f"Generating summary for {character_name}, turns {start_turn}-{end_turn} ({window_type})")
 
-            turn_text_blocks.append(entry)
+                    # ResilientActionGenerator's generate() method already handles fallback automatically
+                    # It will try providers in order if one refuses due to mature content
+                    print(f"\n[MemorySummarizer] Calling LLM to generate summary for {character_name}, turns {start_turn}-{end_turn}")
+                    print(f"[MemorySummarizer] System prompt length: {len(system_prompt)} chars")
+                    print(f"[MemorySummarizer] User prompt length: {len(user_prompt)} chars")
 
-        turn_text = "\n\n".join(turn_text_blocks)
-
-        prompt = f"""
-Summarize the following game events from turns {start_turn} to {end_turn}.
-
-Create a concise narrative summary (2-4 paragraphs) that captures:
-1. Major events and character actions
-2. Important outcomes and consequences
-3. Changes in character relationships or situations
-4. Significant plot developments
-
-DO NOT include:
-- Private thoughts (marked as "private thought")
-- Minor routine actions (basic movement, waiting)
-- Excessive detail
-
-Turn History:
-{turn_text}
-
-Provide a clear, coherent narrative summary:
-"""
-        return prompt
-
-    def _get_system_prompt(self) -> str:
-        """Get system prompt for summarization."""
-        return (
-            "You are a narrative summarizer for a dark fantasy role-playing game. "
-            "Create concise, coherent summaries of game events that preserve important "
-            "plot points and character developments while condensing routine actions. "
-            "Write in past tense, third person. Focus on what happened and why it matters."
-        )
-
-    def _create_fallback_summary(self, turns: List[Dict[str, Any]]) -> str:
-        """
-        Create basic fallback summary if LLM fails.
-
-        Args:
-            turns: List of turn records
-
-        Returns:
-            Basic bullet-point summary
-        """
-        logger.warning("Using fallback summary generation (LLM failed)")
-
-        summary_lines = ["Summary of recent events:\n"]
-
-        # Group by turn number
-        turns_by_number: Dict[int, List[Dict]] = {}
-        for turn in turns:
-            turn_num = turn["turn_number"]
-            if turn_num not in turns_by_number:
-                turns_by_number[turn_num] = []
-            turns_by_number[turn_num].append(turn)
-
-        # Create bullet points
-        for turn_num in sorted(turns_by_number.keys()):
-            turn_actions = turns_by_number[turn_num]
-            for action in turn_actions:
-                if not action["is_private"]:  # Skip private thoughts
-                    char_name = action["character_name"]
-                    action_desc = action["action_description"]
-                    summary_lines.append(
-                        f"- Turn {turn_num}: {char_name} - {action_desc}"
+                    response = self.llm_provider.generate(
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        temperature=0.3,  # Lower temperature for consistent summaries
+                        max_tokens=1024
                     )
 
-        return "\n".join(summary_lines)
+                    logger.info(f"Received response from LLM: {len(response)} chars")
+                    print(f"\n[MemorySummarizer] Received response from LLM: {len(response)} chars")
+                    print(f"[MemorySummarizer] Response preview:\n{response[:300]}\n")
+                    logger.debug(f"Response preview: {response[:200]}...")
 
+                    # Parse JSON response
+                    import json
+                    import re
 
-# Example usage
-if __name__ == "__main__":
-    from uuid import uuid4
-    logging.basicConfig(level=logging.INFO)
+                    json_str = response.strip()
 
-    # This would need to be run in Flask context
-    print("Memory Summarizer Service")
-    print("Run this within Flask application context to test")
+                    # Extract JSON from markdown if needed
+                    if "```json" in json_str:
+                        json_str = json_str.split("```json")[1].split("```")[0].strip()
+                    elif "```" in json_str:
+                        json_str = json_str.split("```")[1].split("```")[0].strip()
+
+                    # Clean trailing commas
+                    json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+
+                    # Try to parse JSON, handling control character errors from some providers
+                    try:
+                        result = json.loads(json_str)
+                    except json.JSONDecodeError as json_error:
+                        # If it's a control character error, try to fix it
+                        if "Invalid control character" in str(json_error):
+                            logger.warning(f"JSON contains control characters, attempting to clean: {json_error}")
+                            # Replace common unescaped control characters
+                            # This handles cases where LLMs put literal newlines/tabs in JSON strings
+                            cleaned_json = json_str
+                            # Replace unescaped control characters within string values
+                            # We need to be careful to only replace inside quoted strings
+                            # Simple approach: escape common control chars
+                            cleaned_json = cleaned_json.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                            # Try parsing the cleaned version
+                            try:
+                                result = json.loads(cleaned_json)
+                                logger.info("Successfully parsed JSON after cleaning control characters")
+                            except json.JSONDecodeError as cleaned_error:
+                                logger.error(f"Still failed after cleaning: {cleaned_error}")
+                                logger.error(f"Attempted to parse: {cleaned_json[:500]}...")
+                                raise
+                        else:
+                            # Different JSON error, try regex extraction as fallback
+                            logger.warning(f"JSON parse error: {json_error}")
+                            logger.warning(f"Attempting regex extraction from: {json_str[:200]}...")
+
+                            # Try to extract fields using regex
+                            descriptive_match = re.search(r'"descriptive_summary"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str, re.DOTALL)
+                            condensed_match = re.search(r'"condensed_summary"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str, re.DOTALL)
+
+                            if descriptive_match and condensed_match:
+                                descriptive = descriptive_match.group(1).replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t').replace('\\"', '"')
+                                condensed = condensed_match.group(1).replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t').replace('\\"', '"')
+                                logger.info("Successfully extracted summaries using regex")
+                                return (descriptive, condensed)
+                            else:
+                                logger.error("Could not extract summaries using regex")
+                                raise
+
+                    descriptive = result.get('descriptive_summary', '').strip()
+                    condensed = result.get('condensed_summary', '').strip()
+
+                    if not descriptive or not condensed:
+                        logger.error(f"Missing summaries in response. Keys found: {list(result.keys())}")
+                        logger.error(f"Response content: {json_str[:500]}...")
+                        print(f"\n[MemorySummarizer ERROR] Missing summaries in JSON!")
+                        print(f"Keys found: {list(result.keys())}")
+                        print(f"Full result: {result}")
+                        raise ValueError("Missing descriptive or condensed summary in LLM response")
+
+                    logger.info(f"Successfully generated summaries: {len(descriptive)} / {len(condensed)} chars")
+                    print(f"[MemorySummarizer SUCCESS] Generated summaries: descriptive={len(descriptive)} chars, condensed={len(condensed)} chars")
+                    print(f"Descriptive summary preview: {descriptive[:150]}...")
+
+                    # Success! Return the summaries
+                    return (descriptive, condensed)
+
+                except Exception as attempt_error:
+                    # Store the error for potential retry
+                    last_error = attempt_error
+                    logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed: {attempt_error}")
+                    print(f"[MemorySummarizer] Attempt {attempt + 1}/{max_attempts} failed: {str(attempt_error)[:100]}")
+
+                    # If this was the last attempt, we'll fall through to the outer exception handler
+                    if attempt < max_attempts - 1:
+                        # Not the last attempt, continue to retry
+                        continue
+                    else:
+                        # Last attempt failed, re-raise to outer handler
+                        raise
+
+        except Exception as e:
+            logger.error(f"Error generating summary after {max_attempts} attempts: {e}", exc_info=True)
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Character: {character_name}, Window: {window_type}, Turns: {start_turn}-{end_turn}")
+
+            print(f"\n[MemorySummarizer ERROR] All {max_attempts} attempts failed!")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {str(e)}")
+            print(f"Character: {character_name}, Window: {window_type}, Turns: {start_turn}-{end_turn}")
+
+            # Check if this is an AllProvidersFailedError from resilient generator
+            if "AllProvidersFailedError" in str(type(e)):
+                logger.error("All LLM providers failed for summary generation!")
+                logger.error(f"Last error from providers: {getattr(e, 'last_error', 'Unknown')}")
+                print(f"[MemorySummarizer ERROR] All LLM providers failed!")
+                print(f"Last error from providers: {getattr(e, 'last_error', 'Unknown')}")
+                if hasattr(e, 'attempted_providers'):
+                    print(f"Attempted providers: {e.attempted_providers}")
+
+            # Fallback to basic summary after all retries exhausted
+            logger.warning(f"Using fallback generic summary after {max_attempts} failed attempts")
+            print(f"[MemorySummarizer WARNING] Using fallback generic summary after all retries exhausted\n")
+            descriptive = f"{character_name} experienced {len(turn_history)} events during turns {start_turn}-{end_turn}."
+            condensed = f"Turns {start_turn}-{end_turn}: {len(turn_history)} events."
+            return (descriptive, condensed)
+
+    def generate_summaries_for_character(
+        self,
+        db_session,
+        game_state_id: UUID,
+        character_id: UUID,
+        current_turn: int
+    ) -> Dict[str, Any]:
+        """
+        Generate all needed summaries for a character at current turn.
+
+        Checks which summaries need to be generated and creates them.
+
+        Args:
+            db_session: Database session
+            game_state_id: Game state UUID
+            character_id: Character UUID
+            current_turn: Current turn number
+
+        Returns:
+            Dictionary with generation results
+        """
+        logger.info(f"Checking summaries needed for character {character_id} at turn {current_turn}")
+
+        # Check which summaries are needed
+        needed = db_session.execute(
+            text("SELECT * FROM memory_summary_check_needed(:game_id, :char_id, :turn)"),
+            {
+                "game_id": str(game_state_id),
+                "char_id": str(character_id),
+                "turn": current_turn
+            }
+        ).fetchall()
+
+        results = {
+            'generated': [],
+            'skipped': [],
+            'errors': []
+        }
+
+        for row in needed:
+            window_type, start_turn, end_turn, is_needed, reason = row
+
+            if not is_needed:
+                results['skipped'].append({
+                    'window_type': window_type,
+                    'reason': reason
+                })
+                continue
+
+            try:
+                logger.info(f"Generating {window_type} summary for turns {start_turn}-{end_turn}...")
+
+                # Generate summaries
+                descriptive, condensed = self.generate_summary_for_window(
+                    db_session,
+                    game_state_id,
+                    character_id,
+                    window_type,
+                    start_turn,
+                    end_turn
+                )
+
+                # Store in database
+                summary_id = db_session.execute(
+                    text("""
+                        SELECT memory_summary_upsert(
+                            :game_id, :char_id, :window_type,
+                            :start_turn, :end_turn,
+                            :descriptive, :condensed
+                        )
+                    """),
+                    {
+                        "game_id": str(game_state_id),
+                        "char_id": str(character_id),
+                        "window_type": window_type,
+                        "start_turn": start_turn,
+                        "end_turn": end_turn,
+                        "descriptive": descriptive,
+                        "condensed": condensed
+                    }
+                ).scalar()
+
+                db_session.commit()
+
+                # Embed in vector store if available
+                embedding_success = False
+                if self.vector_store:
+                    try:
+                        # Get character name for metadata using stored procedure
+                        character_result = db_session.execute(
+                            text("SELECT * FROM character_get(:id)"),
+                            {"id": str(character_id)}
+                        ).fetchone()
+                        character_name = character_result.name if character_result else "Unknown"
+
+                        # Prepare metadata
+                        metadata = {
+                            'game_state_id': str(game_state_id),
+                            'character_id': str(character_id),
+                            'character_name': character_name,
+                            'window_type': window_type,
+                            'start_turn': start_turn,
+                            'end_turn': end_turn,
+                            'turn_span': end_turn - start_turn + 1
+                        }
+
+                        # Embed descriptive version by default
+                        embedding_success = self.vector_store.add_summary(
+                            summary_id=str(summary_id),
+                            text=descriptive,
+                            metadata=metadata,
+                            use_descriptive=True
+                        )
+
+                        if embedding_success:
+                            # Mark as embedded in database
+                            db_session.execute(
+                                text("""
+                                    SELECT memory_summary_mark_embedded(
+                                        :summary_id, :embedding_id, :version
+                                    )
+                                """),
+                                {
+                                    "summary_id": str(summary_id),
+                                    "embedding_id": str(summary_id),
+                                    "version": "descriptive"
+                                }
+                            )
+                            db_session.commit()
+                            logger.info(f"Embedded summary {summary_id} in Qdrant")
+                        else:
+                            logger.warning(f"Failed to embed summary {summary_id} in Qdrant")
+
+                    except Exception as embed_error:
+                        logger.error(f"Error embedding summary: {embed_error}", exc_info=True)
+
+                results['generated'].append({
+                    'window_type': window_type,
+                    'turn_range': f"{start_turn}-{end_turn}",
+                    'summary_id': str(summary_id),
+                    'descriptive_len': len(descriptive),
+                    'condensed_len': len(condensed),
+                    'embedded': embedding_success
+                })
+
+                logger.info(f"Stored {window_type} summary: {summary_id}")
+
+            except Exception as e:
+                logger.error(f"Error generating {window_type} summary: {e}", exc_info=True)
+                # Rollback the failed transaction so subsequent iterations can proceed
+                db_session.rollback()
+                results['errors'].append({
+                    'window_type': window_type,
+                    'error': str(e)
+                })
+
+        return results
+
+    def get_summaries_for_context(
+        self,
+        db_session,
+        game_state_id: UUID,
+        character_id: UUID,
+        use_descriptive: bool = True,
+        exclude_recent_n_turns: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all relevant summaries for a character to use in LLM context.
+
+        Args:
+            db_session: Database session
+            game_state_id: Game state UUID
+            character_id: Character UUID
+            use_descriptive: If True, use descriptive summaries; if False, use condensed
+            exclude_recent_n_turns: Exclude windows that overlap with recent N turns
+                                   (those turns will be in working memory instead)
+
+        Returns:
+            List of summary dictionaries ordered by recency
+        """
+        summaries = db_session.execute(
+            text("""
+                SELECT * FROM memory_summary_get_latest_tiers(
+                    :game_id, :char_id, :use_descriptive
+                )
+            """),
+            {
+                "game_id": str(game_state_id),
+                "char_id": str(character_id),
+                "use_descriptive": use_descriptive
+            }
+        ).fetchall()
+
+        # Get current turn to filter out overlapping windows
+        current_turn_result = db_session.execute(
+            text("SELECT current_turn FROM game.game_state WHERE game_state_id = :id"),
+            {"id": str(game_state_id)}
+        ).fetchone()
+
+        current_turn = current_turn_result[0] if current_turn_result else 0
+        cutoff_turn = current_turn - exclude_recent_n_turns
+
+        result = []
+        for row in summaries:
+            window_type, start_turn, end_turn, summary_text, turn_span = row
+
+            # Skip if this window overlaps with recent working memory
+            if end_turn > cutoff_turn:
+                continue
+
+            result.append({
+                'window_type': window_type,
+                'start_turn': start_turn,
+                'end_turn': end_turn,
+                'summary': summary_text,
+                'turn_span': turn_span
+            })
+
+        return result
+
+    def search_relevant_summaries(
+        self,
+        query: str,
+        character_id: UUID = None,
+        limit: int = 5,
+        score_threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for relevant memory summaries using semantic similarity.
+
+        Args:
+            query: The search query text (e.g., "conflicts with guards")
+            character_id: Optional character UUID to filter by
+            limit: Maximum number of results
+            score_threshold: Minimum similarity score (0-1)
+
+        Returns:
+            List of relevant summary dictionaries
+        """
+        if not self.vector_store:
+            logger.warning("Vector store not available for summary search")
+            return []
+
+        try:
+            if character_id:
+                results = self.vector_store.search_summaries_by_character(
+                    query=query,
+                    character_id=str(character_id),
+                    limit=limit,
+                    score_threshold=score_threshold
+                )
+            else:
+                results = self.vector_store.search_summaries(
+                    query=query,
+                    limit=limit,
+                    score_threshold=score_threshold
+                )
+
+            logger.info(f"Found {len(results)} relevant summaries for query: {query[:50]}...")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error searching summaries: {e}", exc_info=True)
+            return []

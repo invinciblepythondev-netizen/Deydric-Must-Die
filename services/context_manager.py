@@ -602,7 +602,8 @@ def _detect_context_relevance(
 
 def _build_dynamic_character_identity(
     character: Dict[str, Any],
-    relevance: Dict[str, bool]
+    relevance: Dict[str, bool],
+    model: str = None
 ) -> str:
     """
     Build character identity string with only relevant attributes.
@@ -610,6 +611,7 @@ def _build_dynamic_character_identity(
     Args:
         character: Character profile
         relevance: Which attributes are relevant
+        model: Model name for determining whether to use detailed or summary appearance
 
     Returns:
         Formatted character identity string
@@ -622,8 +624,27 @@ def _build_dynamic_character_identity(
     if character.get('physical_appearance'):
         parts.append(f"Appearance: {character.get('physical_appearance')}")
 
-    if character.get('current_clothing'):
+    # Get current clothing from Qdrant (dynamically generated from worn items)
+    clothing_description = character.get('current_clothing_from_items')
+    if clothing_description:
+        parts.append(f"Clothing: {clothing_description}")
+    elif character.get('current_clothing'):
+        # Fallback to static database field if dynamic clothing not available
         parts.append(f"Clothing: {character.get('current_clothing')}")
+
+    # Add appearance state (detailed for large models, summary for small models)
+    from services.context_manager import ModelContextLimits
+    context_limit = ModelContextLimits.get_limit(model) if model else 100000
+    use_detailed = context_limit >= 100000  # Use detailed for models with 100K+ token windows
+
+    appearance_state = None
+    if use_detailed and character.get('appearance_state_detailed'):
+        appearance_state = character.get('appearance_state_detailed')
+    elif character.get('appearance_state_summary'):
+        appearance_state = character.get('appearance_state_summary')
+
+    if appearance_state:
+        parts.append(f"Current appearance state: {appearance_state}")
 
     if relevance["personality"]:
         parts.append(f"Personality: {character.get('personality_traits')}")
@@ -722,7 +743,7 @@ def build_character_context(
     memory_window = _get_adaptive_memory_window(model)
 
     # CRITICAL - always include (now with dynamic relevance-based identity)
-    character_identity = _build_dynamic_character_identity(character, relevance)
+    character_identity = _build_dynamic_character_identity(character, relevance, model)
     assembler.add_component(
         name="character_identity",
         content=character_identity,

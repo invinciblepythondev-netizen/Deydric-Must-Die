@@ -181,28 +181,45 @@
             loadingDiv.style.display = 'none';
 
             if (data.actions && data.actions.length > 0) {
-                data.actions.forEach((action, index) => {
+                data.actions.forEach((option, index) => {
                     const actionDiv = document.createElement('div');
                     actionDiv.className = 'action-option';
 
                     // Build action HTML
                     let actionHTML = `<h4>Option ${index + 1}</h4>`;
 
-                    // Show thought if present (check both field names)
-                    const thought = action.private_thought || action.thought || '';
-                    if (thought && thought.trim()) {
-                        actionHTML += `<p class="thought"><em><strong>Private Thought:</strong> ${escapeHtml(thought)}</em></p>`;
-                    }
+                    // If actions array is provided, use it; otherwise fallback to legacy fields
+                    if (option.actions && Array.isArray(option.actions)) {
+                        // NEW FORMAT: Display each action in sequence
+                        option.actions.forEach((action, actionIndex) => {
+                            const actionType = action.type || 'action';
+                            const description = action.description || '';
 
-                    // Show speech/dialogue if present (check both field names)
-                    const speech = action.dialogue || action.speech || '';
-                    if (speech && speech.trim() && speech !== 'null') {
-                        actionHTML += `<p class="speech"><strong>Say:</strong> "${escapeHtml(speech)}"</p>`;
-                    }
+                            if (description && description.trim()) {
+                                if (actionType === 'think') {
+                                    actionHTML += `<p class="thought"><em><strong>Private Thought:</strong> ${escapeHtml(description)}</em></p>`;
+                                } else if (actionType === 'speak') {
+                                    actionHTML += `<p class="speech"><strong>Say:</strong> "${escapeHtml(description)}"</p>`;
+                                } else {
+                                    actionHTML += `<p class="physical-action"><strong>Do:</strong> ${escapeHtml(description)}</p>`;
+                                }
+                            }
+                        });
+                    } else {
+                        // LEGACY FORMAT: Display old field names
+                        const thought = option.private_thought || option.thought || '';
+                        if (thought && thought.trim()) {
+                            actionHTML += `<p class="thought"><em><strong>Private Thought:</strong> ${escapeHtml(thought)}</em></p>`;
+                        }
 
-                    // Show physical action
-                    if (action.action && action.action.trim()) {
-                        actionHTML += `<p class="physical-action"><strong>Do:</strong> ${escapeHtml(action.action)}</p>`;
+                        const speech = option.dialogue || option.speech || '';
+                        if (speech && speech.trim() && speech !== 'null') {
+                            actionHTML += `<p class="speech"><strong>Say:</strong> "${escapeHtml(speech)}"</p>`;
+                        }
+
+                        if (option.action && option.action.trim()) {
+                            actionHTML += `<p class="physical-action"><strong>Do:</strong> ${escapeHtml(option.action)}</p>`;
+                        }
                     }
 
                     // Add select button
@@ -280,10 +297,10 @@
     }
 
     // Select and execute player action
-    async function selectAction(actionIndex, actions) {
-        const selectedAction = actions[actionIndex];
+    async function selectAction(actionIndex, actionOptions) {
+        const selectedOption = actionOptions[actionIndex];
         const loadingDiv = document.getElementById('loading');
-        const actionOptions = document.getElementById('action-options');
+        const actionOptionsDiv = document.getElementById('action-options');
 
         // Clear action list and show visual cue
         document.getElementById('actions-list').innerHTML = '<p class="action-selected-message">✓ Action selected! Processing...</p>';
@@ -293,20 +310,34 @@
 
         loadingDiv.style.display = 'block';
 
-        // Get speech/dialogue (check both field names)
-        const speech = selectedAction.dialogue || selectedAction.speech || '';
-        const thought = selectedAction.private_thought || selectedAction.thought || '';
-        const action = selectedAction.action || '';
+        const emotionalTone = selectedOption.emotional_tone || 'neutral';
+        const currentStance = selectedOption.current_stance || 'standing';
+        const currentClothing = selectedOption.current_clothing || 'unchanged';
+        const turnDuration = selectedOption.turn_duration || 1;
+
+        // Build request body - prefer new actions array format
+        const requestBody = {
+            emotional_tone: emotionalTone,
+            current_stance: currentStance,
+            current_clothing: currentClothing,
+            turn_duration: turnDuration
+        };
+
+        // Use actions array if available (new format)
+        if (selectedOption.actions && Array.isArray(selectedOption.actions)) {
+            requestBody.actions = selectedOption.actions;
+        } else {
+            // Fallback to legacy format
+            requestBody.thought = selectedOption.private_thought || selectedOption.thought || '';
+            requestBody.dialogue = selectedOption.dialogue || selectedOption.speech || '';
+            requestBody.action = selectedOption.action || '';
+        }
 
         try {
             const response = await fetch('/game/action', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    thought: thought,
-                    dialogue: speech,
-                    action: action
-                })
+                body: JSON.stringify(requestBody)
             });
 
             const result = await response.json();
@@ -321,7 +352,7 @@
                 }
 
                 // Clear the action options
-                actionOptions.style.display = 'none';
+                actionOptionsDiv.style.display = 'none';
                 document.getElementById('ai-turn-section').style.display = 'block';
 
                 // Automatically execute AI turn

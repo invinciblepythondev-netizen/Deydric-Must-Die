@@ -20,10 +20,17 @@ class Config:
     SQLALCHEMY_DATABASE_URI = os.getenv('NEON_DATABASE_URL')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
-        'pool_pre_ping': True,
-        'pool_recycle': 300,
+        'pool_pre_ping': True,  # Test connections before using them
+        'pool_recycle': 3600,  # Recycle connections every hour (Neon timeout is typically 5-10 min idle)
         'pool_size': 10,
-        'max_overflow': 20
+        'max_overflow': 20,
+        'connect_args': {
+            'connect_timeout': 10,  # 10 second connection timeout
+            'keepalives': 1,  # Enable TCP keepalives
+            'keepalives_idle': 30,  # Send keepalive after 30s idle
+            'keepalives_interval': 10,  # Retry keepalive every 10s
+            'keepalives_count': 5  # Retry 5 times before giving up
+        }
     }
 
     # LLM Providers

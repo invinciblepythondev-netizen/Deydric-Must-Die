@@ -92,9 +92,9 @@ class ProviderCapability:
                 "notes": "API access to open models. More permissive. No content filtering.",
                 "cost_per_1k_tokens": 0.0006
             },
-            "meta-llama/Llama-3-70b-chat-hf": {
+            "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo": {
                 "max_intensity": ContentIntensity.UNRESTRICTED,
-                "notes": "Large open model via API. Very permissive. No content filtering.",
+                "notes": "Llama 3.1 70B Instruct. Very permissive, no safety training. Use instead of chat-hf.",
                 "cost_per_1k_tokens": 0.0009
             },
             "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": {
@@ -109,9 +109,9 @@ class ProviderCapability:
                 "notes": "AIML API - Llama 3.1 405B. Highest quality open model, very permissive.",
                 "cost_per_1k_tokens": 0.0027
             },
-            "meta-llama/Llama-3-70b-chat-hf": {
+            "meta-llama/Meta-Llama-3-70B-Instruct": {
                 "max_intensity": ContentIntensity.UNRESTRICTED,
-                "notes": "AIML API - Llama 3 70B. Very permissive, good quality.",
+                "notes": "AIML API - Llama 3 70B Instruct. Very permissive, good quality. Avoid chat-hf variants.",
                 "cost_per_1k_tokens": 0.0008
             },
             "mistralai/Mixtral-8x7B-Instruct-v0.1": {
@@ -336,8 +336,8 @@ class ProviderStrategy:
         if "content_filter" in error_str:
             return RefusalReason.SAFETY_FILTER
 
-        # Rate limiting
-        if "rate" in error_str or "429" in error_str:
+        # Rate limiting and quota errors
+        if "rate" in error_str or "429" in error_str or "quota" in error_str or "insufficient_quota" in error_str:
             return RefusalReason.RATE_LIMIT
 
         # Timeout

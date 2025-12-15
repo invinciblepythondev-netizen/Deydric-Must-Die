@@ -98,6 +98,8 @@ RETURNS TABLE (
     action_description TEXT,
     is_private BOOLEAN,
     outcome_description TEXT,
+    turn_duration INTEGER,
+    remaining_duration INTEGER,
     created_at TIMESTAMP
 ) AS $$
 BEGIN
@@ -105,7 +107,7 @@ BEGIN
     SELECT
         th.turn_id, th.turn_number, th.sequence_number, th.character_id, c.name,
         th.action_type, th.action_description, th.is_private,
-        th.outcome_description, th.created_at
+        th.outcome_description, th.turn_duration, th.remaining_duration, th.created_at
     FROM memory.turn_history th
     JOIN character.character c ON c.character_id = th.character_id
     WHERE th.game_state_id = p_game_state_id

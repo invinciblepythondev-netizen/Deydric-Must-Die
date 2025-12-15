@@ -10,6 +10,7 @@ import os
 from flask import Flask
 from dotenv import load_dotenv
 from database import db, init_db
+from config import get_config
 
 # Load environment variables
 load_dotenv()
@@ -23,23 +24,19 @@ def create_app():
     """
     app = Flask(__name__)
 
-    # Configuration
-    app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key-change-in-production')
+    # Load configuration from config.py
+    env = os.getenv('FLASK_ENV', 'development')
+    config_class = get_config(env)
+    app.config.from_object(config_class)
 
-    # Get database URL and ensure it uses psycopg (psycopg3) driver
-    database_url = os.getenv('NEON_DATABASE_URL')
+    # Ensure psycopg driver is used
+    database_url = app.config['SQLALCHEMY_DATABASE_URI']
     if database_url and 'postgresql://' in database_url:
         # Replace postgresql:// with postgresql+psycopg:// to use psycopg3
         database_url = database_url.replace('postgresql://', 'postgresql+psycopg://')
+        app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 
-    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-        'pool_pre_ping': True,  # Verify connections before using them
-        'pool_recycle': 300,     # Recycle connections after 5 minutes
-    }
-
-    # Initialize extensions
+    # Initialize extensions (includes database connection error handling)
     init_db(app)
 
     # Register blueprints
